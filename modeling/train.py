@@ -1,13 +1,18 @@
 """
-LightGBM 바이럴 예측 모델
+LightGBM 바이럴 예측 모델  (Optuna TPE 하이퍼파라미터 튜닝 포함)
 - virality_score : (future_peak - baseline_90d) / (std_90d + 1e-6)
 - peak_timing    : argmax(search_trend[t+1:t+30]) + 1  (1~30일)
 
 사용법:
+    # 기본 파라미터로 학습
     python modeling/train.py --data data_processed/features.csv
+
+    # Optuna TPE 튜닝 후 최적 파라미터로 학습 (trial 50회)
+    python modeling/train.py --data data_processed/features.csv --tune --n_trials 50
 """
 
 import argparse
+import json
 import os
 import sys
 import warnings
@@ -15,6 +20,7 @@ import warnings
 import lightgbm as lgb
 import matplotlib.pyplot as plt
 import numpy as np
+import optuna
 import pandas as pd
 import shap
 from sklearn.metrics import mean_absolute_error, mean_squared_error
@@ -25,6 +31,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from feature_engineering.feature_config import FEATURE_COLS
 
 warnings.filterwarnings("ignore")
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 # ── 상수 ──────────────────────────────────────────────────────────────────────
 TARGET_VIRALITY = "virality_score"
@@ -49,6 +56,18 @@ DEFAULT_PARAMS = {
     "random_state"     : 42,
     "n_jobs"           : -1,
     "verbose"          : -1,
+}
+
+# Optuna TPE 탐색 범위
+SEARCH_SPACE = {
+    "learning_rate"    : ("float", 1e-3, 0.3,   True),   # (type, low, high, log)
+    "num_leaves"       : ("int",   16,   256),
+    "max_depth"        : ("int",   3,    12),
+    "min_child_samples": ("int",   5,    100),
+    "subsample"        : ("float", 0.5,  1.0,   False),
+    "colsample_bytree" : ("float", 0.5,  1.0,   False),
+    "reg_alpha"        : ("float", 1e-4, 10.0,  True),
+    "reg_lambda"       : ("float", 1e-4, 10.0,  True),
 }
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs")
@@ -81,6 +100,62 @@ def split_data(df: pd.DataFrame):
         val_ratio   = VALID_RATIO / (1 - TRAIN_RATIO)
         valid, test = train_test_split(tmp, test_size=1 - val_ratio, random_state=42)
         return train, valid, test
+
+
+# ── Optuna TPE 튜닝 ───────────────────────────────────────────────────────────
+def tune_params(
+    X_train, y_train,
+    X_valid, y_valid,
+    target: str,
+    n_trials: int,
+    fixed_params: dict,
+) -> dict:
+    """
+    Optuna TPE Sampler로 valid RMSE 최소화 파라미터 탐색.
+    이전 trial 결과를 반영해 유망한 파라미터 범위를 점점 좁혀감.
+    """
+    print(f"\nOptuna TPE 튜닝 시작: {target}  (trials={n_trials})")
+
+    def objective(trial: optuna.Trial) -> float:
+        params = {**fixed_params}
+        for name, spec in SEARCH_SPACE.items():
+            if spec[0] == "float":
+                log = spec[3] if len(spec) > 3 else False
+                params[name] = trial.suggest_float(name, spec[1], spec[2], log=log)
+            elif spec[0] == "int":
+                params[name] = trial.suggest_int(name, spec[1], spec[2])
+
+        params["n_estimators"] = 1000  # early stopping 으로 결정
+
+        model = lgb.LGBMRegressor(**params)
+        model.fit(
+            X_train, y_train,
+            eval_set=[(X_valid, y_valid)],
+            callbacks=[
+                lgb.early_stopping(stopping_rounds=50, verbose=False),
+                lgb.log_evaluation(period=-1),
+            ],
+        )
+        return rmse_score(y_valid, model.predict(X_valid))
+
+    study = optuna.create_study(
+        direction="minimize",
+        sampler=optuna.samplers.TPESampler(seed=42),
+    )
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+
+    best = study.best_params
+    print(f"  최적 valid RMSE : {study.best_value:.4f}")
+    print(f"  최적 파라미터   : {best}")
+
+    # 결과 저장
+    out = {"target": target, "best_rmse": study.best_value, "best_params": best}
+    path = os.path.join(OUTPUT_DIR, f"best_params_{target}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2, ensure_ascii=False)
+    print(f"  저장: {path}")
+
+    return {**fixed_params, **best}
 
 
 # ── LightGBM 학습 ─────────────────────────────────────────────────────────────
@@ -141,12 +216,22 @@ def run_model(
     X_valid, y_valid,
     X_test,  y_test,
     target: str,
-    params: dict,
+    base_params: dict,
+    do_tune: bool,
+    n_trials: int,
 ) -> list[dict]:
 
     print(f"\n{'='*55}")
     print(f"  {target} 모델")
     print(f"{'='*55}")
+
+    if do_tune:
+        params = tune_params(
+            X_train, y_train, X_valid, y_valid,
+            target, n_trials, base_params,
+        )
+    else:
+        params = base_params
 
     model = train_lgbm(X_train, y_train, X_valid, y_valid, target, params)
 
@@ -165,7 +250,7 @@ def run_model(
 
 
 # ── 메인 ──────────────────────────────────────────────────────────────────────
-def main(csv_path: str):
+def main(csv_path: str, do_tune: bool, n_trials: int):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # 1. 데이터 로드
@@ -190,8 +275,10 @@ def main(csv_path: str):
         X_train, train_df[TARGET_VIRALITY],
         X_valid, valid_df[TARGET_VIRALITY],
         X_test,  test_df[TARGET_VIRALITY],
-        target = TARGET_VIRALITY,
-        params = {**DEFAULT_PARAMS},
+        target     = TARGET_VIRALITY,
+        base_params= {**DEFAULT_PARAMS},
+        do_tune    = do_tune,
+        n_trials   = n_trials,
     )
 
     # 4. peak_timing 모델 (MAE 직접 최적화)
@@ -199,8 +286,10 @@ def main(csv_path: str):
         X_train, train_df[TARGET_TIMING],
         X_valid, valid_df[TARGET_TIMING],
         X_test,  test_df[TARGET_TIMING],
-        target = TARGET_TIMING,
-        params = {**DEFAULT_PARAMS, "objective": "regression_l1"},
+        target     = TARGET_TIMING,
+        base_params= {**DEFAULT_PARAMS, "objective": "regression_l1"},
+        do_tune    = do_tune,
+        n_trials   = n_trials,
     )
 
     # 5. 결과 저장
@@ -220,5 +309,13 @@ if __name__ == "__main__":
         "--data", type=str, default="data_processed/features.csv",
         help="feature + target 컬럼이 포함된 CSV 경로",
     )
+    parser.add_argument(
+        "--tune", action="store_true",
+        help="Optuna TPE 하이퍼파라미터 튜닝 활성화",
+    )
+    parser.add_argument(
+        "--n_trials", type=int, default=50,
+        help="Optuna trial 횟수 (기본값: 50)",
+    )
     args = parser.parse_args()
-    main(args.data)
+    main(args.data, args.tune, args.n_trials)
