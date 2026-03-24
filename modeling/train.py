@@ -26,9 +26,10 @@ import shap
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import train_test_split
 
-# feature_engineering/feature_config.py 에서 FEATURE_COLS import
+# feature_engineering 모듈 import
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from feature_engineering.feature_config import FEATURE_COLS
+from modeling.data_loader import load_csv
 
 warnings.filterwarnings("ignore")
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -253,13 +254,9 @@ def run_model(
 def main(csv_path: str, do_tune: bool, n_trials: int):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # 1. 데이터 로드
-    df = pd.read_csv(csv_path)
+    # 1. 데이터 로드 (컬럼 검증 및 재정렬 포함)
+    df = load_csv(csv_path)
     print(f"데이터 로드: {df.shape}  ({csv_path})")
-
-    for col in [TARGET_VIRALITY, TARGET_TIMING] + FEATURE_COLS:
-        if col not in df.columns:
-            raise ValueError(f"컬럼 '{col}'이 CSV에 없습니다.")
 
     # 2. 분할
     train_df, valid_df, test_df = split_data(df)
