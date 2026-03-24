@@ -1,0 +1,21 @@
+# 키워드 수집 파이프라인 설정
+
+crawl:
+  cid_1st: "50000006"          # 식품
+  cid_2nd: "50000149"          # 과자/베이커리
+  cat_1st_name: "식품"
+  cat_2nd_name: "과자베이커리"
+  start_date: "2022-01-01"
+  end_date: "2026-03-01"
+  window_months: 1
+  pages: 25                    # 20개 × 25 = 500
+
+aggregate:
+  final_n: 500
+  min_appearance: 4            # 최소 4개월 이상 등장
+  seed: null                   # null이면 매 실행마다 랜덤 시드
+  strata:
+    Q1_rare: 125
+    Q2_low: 125
+    Q3_mid: 125
+    Q4_freq: 125
