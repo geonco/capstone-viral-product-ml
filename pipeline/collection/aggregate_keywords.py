@@ -80,8 +80,8 @@ def compute_stats(df: pd.DataFrame) -> pd.DataFrame:
     return agg
 
 
+# appearance 기반 사분위로 층 배정
 def assign_quartile_strata(pool: pd.DataFrame) -> pd.DataFrame:
-    """appearance 기반 사분위로 층 배정 (pd.qcut)."""
     pool = pool.copy()
     try:
         pool["stratum"] = pd.qcut(
