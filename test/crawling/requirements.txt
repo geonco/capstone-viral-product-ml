@@ -1,2 +1,6 @@
 playwright
 pandas
+requests
+python-dotenv
+numpy
+scikit-learn
