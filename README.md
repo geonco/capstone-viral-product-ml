@@ -28,6 +28,7 @@ capstone-ml/
 │   ├── metrics/                #   평가 결과
 │   └── figures/                #   SHAP plot, 차트
 │
+├── experiments/                # 탐색적 실험 (파이프라인 외)
 ├── notebooks/                  # EDA 전용 (프로덕션 코드 금지)
 ├── docs/                       # 설계 문서
 ├── tests/                      # 단위 테스트 (pytest)
@@ -49,5 +50,7 @@ playwright install chromium
 
 # 키워드 수집 파이프라인
 python pipeline/collection/crawl_keywords.py
-python pipeline/collection/aggregate_keywords.py
+python pipeline/collection/select_keywords.py
+python pipeline/collection/crawl_shopping_click_trend.py
+python pipeline/collection/crawl_search_trend.py
 ```
