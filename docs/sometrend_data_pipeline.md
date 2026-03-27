@@ -36,8 +36,8 @@ capstone-viral-product-ml/            ← 팀 레포
 │       ├── build_mention_features.py
 │       └── (클릭해서실행)build_mention_features.bat
 ├── data/
-│   ├── raw/                           # Sometrend2/, keywords_selected_500_*.csv, sometrend_mention_long.csv
-│   └── processed/                     # sometrend_mention_features.csv
+│   ├── raw/                           # Sometrend2/, keywords_selected_500_*.csv
+│   └── interim/                       # sometrend_mention_long.csv
 └── docs/
     └── sometrend_data_pipeline.md     # 이 문서
 ```
