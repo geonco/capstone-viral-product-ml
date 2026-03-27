@@ -19,3 +19,6 @@ outputs/
 
 # macOS
 .DS_Store
+
+# 실험용
+experiments

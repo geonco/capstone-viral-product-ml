@@ -10,7 +10,7 @@ crawl:
   window_months: 1
   pages: 25                    # 20개 × 25 = 500
 
-aggregate:
+select:
   final_n: 500
   min_appearance: 4            # 최소 4개월 이상 등장
   seed: null                   # null이면 매 실행마다 랜덤 시드
@@ -19,3 +19,48 @@ aggregate:
     Q2_low: 125
     Q3_mid: 125
     Q4_freq: 125
+
+click_trend:
+  api_url: "https://openapi.naver.com/v1/datalab/shopping/category/keywords"
+  category: "50000149"            # 과자/베이커리
+  start_date: "2022-01-01"
+  end_date: "2026-02-28"
+  time_unit: "date"
+  sleep_seconds: 0.5
+  input_csv: "keywords_selected_500_seed1527267025.csv"
+
+search_trend:
+  api_url: "https://openapi.naver.com/v1/datalab/search"
+  start_date: "2022-01-01"
+  end_date: "2026-02-28"
+  time_unit: "date"
+  sleep_seconds: 0.5
+  input_csv: "keywords_selected_500_seed1527267025.csv"
+
+click_gender:
+  api_url: "https://openapi.naver.com/v1/datalab/shopping/category/keyword/gender"
+  category: "50000149"
+  start_date: "2022-01-01"
+  end_date: "2026-02-28"
+  time_unit: "date"
+  sleep_seconds: 0.5
+  input_csv: "keywords_selected_500_seed1527267025.csv"
+  groups:
+    - {code: "m", label: "m"}
+    - {code: "f", label: "f"}
+
+click_age:
+  api_url: "https://openapi.naver.com/v1/datalab/shopping/category/keyword/age"
+  category: "50000149"
+  start_date: "2022-01-01"
+  end_date: "2026-02-28"
+  time_unit: "date"
+  sleep_seconds: 0.5
+  input_csv: "keywords_selected_500_seed1527267025.csv"
+  groups:
+    - {code: "10", label: "10"}
+    - {code: "20", label: "20"}
+    - {code: "30", label: "30"}
+    - {code: "40", label: "40"}
+    - {code: "50", label: "50"}
+    - {code: "60", label: "60"}
