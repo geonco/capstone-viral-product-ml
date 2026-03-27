@@ -26,7 +26,7 @@
 
 - **데이터**: 네이버 DataLab API (무료) + 썸트렌드 1개월 (18만원)
 - **키워드**: 과자/베이커리 Top 500 (2022\~현재, 4년)
-- **피처**: 43개 (LightGBM, 멀티윈도우 3/7/14/30d) / 10~15채널 × 60일 + 연관어벡터 20차원 (LSTM) — 6개 그룹 (검색+소셜+교차+컨텍스트+연관어벡터+경제)
+- **피처**: 51개 (LightGBM, Phase 1~3) / 10~15채널 × 60일 (LSTM) — 3개 Phase (검색+클릭 24개 → +SomeTrend 13개 → +Demographic 14개)
 - **모델**: Dummy + Linear Reg. (베이스라인) → LightGBM → LSTM → Weighted Average Ensemble
 - **타겟**: virality_score (바이럴 강도, future14_max/past60_mean) + peak_time (피크 시점, 0\~13일)
 - **컴퓨팅**: Colab 무료로 충분 (LSTM 12분/회, LightGBM 15초/회)
