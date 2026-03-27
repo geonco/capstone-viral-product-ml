@@ -4,8 +4,8 @@ pipeline/features/build_dataset.py
 Phase 1 데이터셋 생성 스크립트.
 
 입력:
-    data/raw/search_absolute.csv
-    data/raw/shopping_click_absolute.csv
+    data/raw/search/absolute.csv
+    data/raw/shopping_click/absolute.csv
 
 출력:
     data/processed/dataset_phase1.csv
@@ -222,8 +222,8 @@ def main() -> None:
 
     # ── 로드 ──
     print("\n[1/4] CSV 로드 중...")
-    search_df = load_wide(RAW_DIR / "search_absolute.csv")
-    click_df  = load_wide(RAW_DIR / "shopping_click_absolute.csv")
+    search_df = load_wide(RAW_DIR / "search" / "absolute.csv")
+    click_df  = load_wide(RAW_DIR / "shopping_click" / "absolute.csv")
     print(f"  search_absolute : {search_df.shape[0]}개 키워드 × {search_df.shape[1]}일")
     print(f"  click_absolute  : {click_df.shape[0]}개 키워드 × {click_df.shape[1]}일")
 
