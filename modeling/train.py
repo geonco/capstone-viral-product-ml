@@ -5,10 +5,10 @@ LightGBM 바이럴 예측 모델  (Optuna TPE 하이퍼파라미터 튜닝 포�
 
 사용법:
     # 기본 파라미터로 학습
-    python training/train.py --data data_raw/dataset_final.csv
+    python modeling/train.py --data data_raw/dataset_final.csv
 
     # Optuna TPE 튜닝 후 최적 파라미터로 학습 (trial 50회)
-    python training/train.py --data data_raw/dataset_final.csv --tune --n_trials 50
+    python modeling/train.py --data data_raw/dataset_final.csv --tune --n_trials 50
 """
 
 import argparse
@@ -71,7 +71,10 @@ SEARCH_SPACE = {
     "reg_lambda"       : ("float", 1e-4, 10.0,  True),
 }
 
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "output")
+_ROOT       = os.path.join(os.path.dirname(__file__), "..")
+DIR_FIGURES = os.path.join(_ROOT, "outputs", "figures")
+DIR_METRICS = os.path.join(_ROOT, "outputs", "metrics")
+DIR_MODELS  = os.path.join(_ROOT, "outputs", "models")
 
 
 # ── 지표 ──────────────────────────────────────────────────────────────────────
@@ -151,7 +154,7 @@ def tune_params(
 
     # 결과 저장
     out = {"target": target, "best_rmse": study.best_value, "best_params": best}
-    path = os.path.join(OUTPUT_DIR, f"best_params_{target}.json")
+    path = os.path.join(DIR_METRICS, f"best_params_{target}.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2, ensure_ascii=False)
     print(f"  저장: {path}")
@@ -191,7 +194,7 @@ def shap_analysis(model: lgb.LGBMRegressor, X: pd.DataFrame, target: str):
     shap.summary_plot(shap_values, X, plot_type="bar", show=False)
     plt.title(f"SHAP Importance (bar) — {target}")
     plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, f"shap_bar_{target}.png"), dpi=150)
+    plt.savefig(os.path.join(DIR_FIGURES, f"shap_bar_{target}.png"), dpi=150)
     plt.close()
 
     # beeswarm plot
@@ -199,7 +202,7 @@ def shap_analysis(model: lgb.LGBMRegressor, X: pd.DataFrame, target: str):
     shap.summary_plot(shap_values, X, show=False)
     plt.title(f"SHAP Beeswarm — {target}")
     plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, f"shap_beeswarm_{target}.png"), dpi=150)
+    plt.savefig(os.path.join(DIR_FIGURES, f"shap_beeswarm_{target}.png"), dpi=150)
     plt.close()
 
     # 중요도 CSV
@@ -207,8 +210,8 @@ def shap_analysis(model: lgb.LGBMRegressor, X: pd.DataFrame, target: str):
         pd.DataFrame({"feature": X.columns, "mean_abs_shap": np.abs(shap_values).mean(0)})
         .sort_values("mean_abs_shap", ascending=False)
     )
-    imp_df.to_csv(os.path.join(OUTPUT_DIR, f"shap_importance_{target}.csv"), index=False)
-    print(f"  저장 완료 → {OUTPUT_DIR}/shap_*_{target}.*")
+    imp_df.to_csv(os.path.join(DIR_METRICS, f"shap_importance_{target}.csv"), index=False)
+    print(f"  저장 완료 → figures/shap_*_{target}.png, metrics/shap_importance_{target}.csv")
 
 
 # ── 모델 파이프라인 ────────────────────────────────────────────────────────────
@@ -232,7 +235,7 @@ def run_model(
             target, n_trials, base_params,
         )
     else:
-        saved_path = os.path.join(OUTPUT_DIR, f"best_params_{target}.json")
+        saved_path = os.path.join(DIR_METRICS, f"best_params_{target}.json")
         if os.path.isfile(saved_path):
             with open(saved_path, encoding="utf-8") as f:
                 saved = json.load(f)
@@ -252,14 +255,16 @@ def run_model(
         results.append(evaluate(y, model.predict(X), split, target))
 
     shap_analysis(model, X_test, target)
-    model.booster_.save_model(os.path.join(OUTPUT_DIR, f"lgbm_{target}.txt"))
+    model.booster_.save_model(os.path.join(DIR_MODELS, f"lgbm_{target}.txt"))
 
     return results
 
 
 # ── 메인 ──────────────────────────────────────────────────────────────────────
 def main(csv_path: str, do_tune: bool, n_trials: int):
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(DIR_FIGURES, exist_ok=True)
+    os.makedirs(DIR_METRICS, exist_ok=True)
+    os.makedirs(DIR_MODELS,  exist_ok=True)
 
     # 1. 데이터 로드 (컬럼 검증 및 재정렬 포함)
     df = load_csv(csv_path)
@@ -298,13 +303,13 @@ def main(csv_path: str, do_tune: bool, n_trials: int):
 
     # 5. 결과 저장
     res_df = pd.DataFrame(results)
-    res_df.to_csv(os.path.join(OUTPUT_DIR, "evaluation_results.csv"), index=False)
+    res_df.to_csv(os.path.join(DIR_METRICS, "evaluation_results.csv"), index=False)
 
     print(f"\n{'='*55}")
     print("최종 평가 결과")
     print("="*55)
     print(res_df.to_string(index=False))
-    print(f"\n모든 결과 저장 완료 → {OUTPUT_DIR}/")
+    print(f"\n모든 결과 저장 완료 → outputs/figures/, metrics/, models/")
 
 
 if __name__ == "__main__":
