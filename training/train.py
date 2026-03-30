@@ -5,10 +5,10 @@ LightGBM 바이럴 예측 모델  (Optuna TPE 하이퍼파라미터 튜닝 포�
 
 사용법:
     # 기본 파라미터로 학습
-    python modeling/train.py --data data_processed/features.csv
+    python training/train.py --data data_raw/dataset_final.csv
 
     # Optuna TPE 튜닝 후 최적 파라미터로 학습 (trial 50회)
-    python modeling/train.py --data data_processed/features.csv --tune --n_trials 50
+    python training/train.py --data data_raw/dataset_final.csv --tune --n_trials 50
 """
 
 import argparse
@@ -27,9 +27,9 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import train_test_split
 
 # feature_engineering 모듈 import
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.append(os.path.dirname(__file__))
 from feature_engineering.feature_config import FEATURE_COLS
-from modeling.data_loader import load_csv
+from data_loader import load_csv
 
 warnings.filterwarnings("ignore")
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -71,7 +71,7 @@ SEARCH_SPACE = {
     "reg_lambda"       : ("float", 1e-4, 10.0,  True),
 }
 
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs")
+OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "output")
 
 
 # ── 지표 ──────────────────────────────────────────────────────────────────────

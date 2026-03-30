@@ -8,8 +8,8 @@ CSV 데이터 전처리 모듈
   - 향후 feature_config.py에 컬럼을 추가하면 이 모듈은 수정하지 않아도 된다.
 
 사용법:
-  from modeling.data_loader import load_csv
-  df = load_csv("data_processed/features.csv")
+  from data_loader import load_csv
+  df = load_csv("data_raw/dataset_final.csv")
 """
 
 import os
