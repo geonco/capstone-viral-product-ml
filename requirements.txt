@@ -1,0 +1,6 @@
+playwright
+pandas
+python-dateutil
+numpy
+pyyaml
+requests

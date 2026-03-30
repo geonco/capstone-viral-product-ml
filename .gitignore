@@ -1,0 +1,24 @@
+# API 키
+.env
+
+# 가상환경
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# 데이터 & 산출물
+data/
+!data/**/.gitkeep
+outputs/
+!outputs/**/.gitkeep
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# 실험용
+experiments
