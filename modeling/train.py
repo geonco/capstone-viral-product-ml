@@ -36,7 +36,7 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 # ── 상수 ──────────────────────────────────────────────────────────────────────
 TARGET_VIRALITY = "virality_score"
-TARGET_TIMING   = "peak_timing"
+TARGET_TIMING   = "peak_time"
 DATE_COL        = "date"
 
 TRAIN_RATIO = 0.70
@@ -232,7 +232,14 @@ def run_model(
             target, n_trials, base_params,
         )
     else:
-        params = base_params
+        saved_path = os.path.join(OUTPUT_DIR, f"best_params_{target}.json")
+        if os.path.isfile(saved_path):
+            with open(saved_path, encoding="utf-8") as f:
+                saved = json.load(f)
+            params = {**base_params, **saved["best_params"]}
+            print(f"  저장된 최적 파라미터 로드: {saved_path}  (best_rmse={saved['best_rmse']:.4f})")
+        else:
+            params = base_params
 
     model = train_lgbm(X_train, y_train, X_valid, y_valid, target, params)
 

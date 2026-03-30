@@ -1,0 +1,14 @@
+{
+  "target": "virality_score",
+  "best_rmse": 2.677360238661285,
+  "best_params": {
+    "learning_rate": 0.0022067338987614665,
+    "num_leaves": 253,
+    "max_depth": 10,
+    "min_child_samples": 74,
+    "subsample": 0.976158295026728,
+    "colsample_bytree": 0.5032864835036815,
+    "reg_alpha": 0.02801815566698882,
+    "reg_lambda": 0.5094399507885001
+  }
+}
