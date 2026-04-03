@@ -22,3 +22,6 @@ outputs/
 
 # 실험용
 experiments
+
+# 로컬 데이터
+modeling/data/

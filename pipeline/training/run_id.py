@@ -11,7 +11,7 @@ python3 modeling/train.py --user leehyn --data ...
 
 # 이후 실행 (저장된 이름 자동 사용)
 python3 modeling/train.py --data ...
-python3 modeling/feature_selection_experiment.py
+python3 pipeline/training/feature_selection_experiment.py
 
 """
 
@@ -19,7 +19,7 @@ import os
 import re
 from datetime import datetime
 
-_ROOT            = os.path.join(os.path.dirname(__file__), "..")
+_ROOT            = os.path.join(os.path.dirname(__file__), "..", "..")
 DIR_OUTPUTS      = os.path.join(_ROOT, "outputs")
 _USERNAME_FILE   = os.path.join(DIR_OUTPUTS, ".username")
 
@@ -45,7 +45,7 @@ def resolve_username(user_arg: str | None) -> str:
 
     raise ValueError(
         "--user 인수로 사용자명을 지정하세요 (이후 자동 저장됨)\n"
-        "  예) python modeling/train.py --user leehyn --data ..."
+        "  예) python pipeline/training/train.py --user leehyn --data ..."
     )
 
 

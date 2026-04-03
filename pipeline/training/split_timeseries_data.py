@@ -5,13 +5,13 @@ dataset_v2.csv를 시계열 순으로 train/valid/test 세트로 나누는 기�
 
 사용법:
     # 기본 비율 (70% train, 15% valid, 15% test)
-    python modeling/split_timeseries_data.py
+    python pipeline/training/split_timeseries_data.py
 
     # 커스텀 비율
-    python modeling/split_timeseries_data.py --train_ratio 0.8 --valid_ratio 0.1 --test_ratio 0.1
+    python pipeline/training/split_timeseries_data.py --train_ratio 0.8 --valid_ratio 0.1 --test_ratio 0.1
 
     # 분할된 데이터 저장
-    python modeling/split_timeseries_data.py --save_splits
+    python pipeline/training/split_timeseries_data.py --save_splits
 """
 
 import argparse
@@ -20,12 +20,12 @@ import pandas as pd
 import sys
 
 # 프로젝트 루트 경로
-_ROOT = os.path.dirname(os.path.dirname(__file__))
-_MODELING_DIR = os.path.dirname(__file__)
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+_TRAINING_DIR = os.path.dirname(__file__)
 sys.path.insert(0, _ROOT)
-sys.path.insert(0, _MODELING_DIR)
+sys.path.insert(0, _TRAINING_DIR)
 
-from modeling.data_loader import load_csv
+from data_loader import load_csv
 
 
 def split_timeseries_data(
@@ -105,7 +105,7 @@ def print_split_info(train_df, valid_df, test_df, date_col="date"):
     print(f"  Test:  {test_keywords}개")
 
 
-def save_splits(train_df, valid_df, test_df, output_dir="modeling/data/splits"):
+def save_splits(train_df, valid_df, test_df, output_dir="data/processed/splits"):
     """분할된 데이터를 별도 파일로 저장합니다."""
     os.makedirs(output_dir, exist_ok=True)
 
@@ -138,7 +138,7 @@ def main():
         description="dataset_v2.csv를 시계열 순으로 train/valid/test 분할"
     )
     parser.add_argument(
-        "--data", type=str, default="modeling/data/dataset_v2.csv",
+        "--data", type=str, default="data/processed/dataset_v2.csv",
         help="입력 데이터 파일 경로"
     )
     parser.add_argument(
@@ -158,7 +158,7 @@ def main():
         help="분할된 데이터를 파일로 저장"
     )
     parser.add_argument(
-        "--output_dir", type=str, default="modeling/data/splits",
+        "--output_dir", type=str, default="data/processed/splits",
         help="분할 데이터 저장 디렉토리"
     )
 

@@ -9,16 +9,16 @@ LightGBM 바이럴 예측 모델  (Optuna TPE 하이퍼파라미터 튜닝 포�
 
 사용법:
     # 최초 실행 (사용자명 등록)
-    python modeling/train.py --user leehyn --data data/processed/dataset_v2.csv
+    python pipeline/training/train.py --user leehyn --data data/processed/dataset_v2.csv
 
     # 이후 생략 가능
-    python modeling/train.py --data data/processed/dataset_v2.csv
+    python pipeline/training/train.py --data data/processed/dataset_v2.csv
 
     # Optuna TPE 튜닝 후 최적 파라미터로 학습 (trial 50회)
-    python modeling/train.py --data data/processed/dataset_v2.csv --tune --n_trials 50
+    python pipeline/training/train.py --data data/processed/dataset_v2.csv --tune --n_trials 50
 
-    # 분할된 데이터 사용 (modeling/data/splits/ 폴더의 train.csv, valid.csv, test.csv)
-    python modeling/train.py --use_splits --tune --n_trials 50
+    # 분할된 데이터 사용 (data/processed/splits/ 폴더의 train.csv, valid.csv, test.csv)
+    python pipeline/training/train.py --use_splits --tune --n_trials 50
     
 출력 구조:
     outputs/0403_leehyn_1/
@@ -89,7 +89,7 @@ SEARCH_SPACE = {
     "reg_lambda"       : ("float", 1e-4, 10.0,  True),
 }
 
-_ROOT       = os.path.join(os.path.dirname(__file__), "..")
+_ROOT       = os.path.join(os.path.dirname(__file__), "..", "..")
 DIR_OUTPUTS = os.path.join(_ROOT, "outputs")
 
 
@@ -312,10 +312,10 @@ def main(csv_path: str, use_splits: bool, do_tune: bool, n_trials: int, user: st
 
     # 1. 데이터 로드 (컬럼 검증 및 재정렬 포함)
     if use_splits:
-        print("분할된 데이터 사용: modeling/data/splits/")
-        train_df = load_csv("modeling/data/splits/train.csv")
-        valid_df = load_csv("modeling/data/splits/valid.csv")
-        test_df  = load_csv("modeling/data/splits/test.csv")
+        print("분할된 데이터 사용: data/processed/splits/")
+        train_df = load_csv("data/processed/splits/train.csv")
+        valid_df = load_csv("data/processed/splits/valid.csv")
+        test_df  = load_csv("data/processed/splits/test.csv")
         print(f"train={len(train_df)}  valid={len(valid_df)}  test={len(test_df)}")
     else:
         df = load_csv(csv_path)
@@ -372,7 +372,7 @@ def main(csv_path: str, use_splits: bool, do_tune: bool, n_trials: int, user: st
     # 6. 실험 요약 문서 저장
     exp_dir   = os.path.join(DIR_OUTPUTS, experiment_name)
     now_str   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    data_desc = "modeling/data/splits/ (train/valid/test.csv)" if use_splits else csv_path
+    data_desc = "data/processed/splits/ (train/valid/test.csv)" if use_splits else csv_path
     split_desc = "외부 분할 파일 사용" if use_splits else f"자동 분할 (train {int(TRAIN_RATIO*100)}% / valid {int(VALID_RATIO*100)}% / test {int((1-TRAIN_RATIO-VALID_RATIO)*100)}%)"
     tune_desc  = f"Optuna TPE ({n_trials} trials)" if do_tune else "비활성화 (기본 파라미터)"
 
@@ -412,12 +412,12 @@ def main(csv_path: str, use_splits: bool, do_tune: bool, n_trials: int, user: st
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--data", type=str, default="modeling/data/dataset_v2.csv",
+        "--data", type=str, default="data/processed/dataset_v2.csv",
         help="feature + target 컬럼이 포함된 CSV 경로",
     )
     parser.add_argument(
         "--use_splits", action="store_true",
-        help="modeling/data/splits/ 폴더의 train.csv, valid.csv, test.csv 사용",
+        help="data/processed/splits/ 폴더의 train.csv, valid.csv, test.csv 사용",
     )
     parser.add_argument(
         "--tune", action="store_true",
