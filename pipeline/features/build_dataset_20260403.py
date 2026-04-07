@@ -1,0 +1,415 @@
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+# ── config ────────────────────────────────────────────────────────────────────
+
+ROOT = Path(__file__).resolve().parent.parent.parent
+RAW = ROOT / "data" / "raw"
+def _out_path():
+    from datetime import date
+    base = ROOT / "data" / "processed"
+    name = f"dataset_{date.today().strftime('%Y%m%d')}"
+    path = base / f"{name}.csv"
+    n = 1
+    while path.exists():
+        path = base / f"{name}_{n}.csv"
+        n += 1
+    return path
+
+PATHS = {
+    "search": RAW / "search" / "absolute.csv",
+    "click": RAW / "shopping_click" / "absolute.csv",
+    "mention": RAW / "sometrends" / "sometrend_mention_long.csv",
+}
+
+START = pd.Timestamp("2022-05-01")
+END = pd.Timestamp("2026-02-14")
+LB, FW = 60, 14
+EPS = 1e-6
+MIN_ABS_CHANGE = 10
+
+CLIP = {"level": (0, 30), "growth": (-2, 20), "cv": (0, 10), "ratio": (0, 50)}
+
+W_FULL = [3, 5, 7, 14, 30]          # scale, level, growth, spikiness, lag
+W_STAT = [7, 14, 30]                 # skew, kurt, cv, rsi (최소 7개 데이터포인트 필요)
+MENTION_COLS = {"블로그": "blog", "인스타그램": "instagram"}
+SIGNALS = ["search", "click", "blog", "instagram"]
+
+
+# ── loading ───────────────────────────────────────────────────────────────────
+
+def load_wide(path):
+    df = pd.read_csv(path, encoding="utf-8-sig", index_col="keyword")
+    df.columns = pd.to_datetime(df.columns)
+    return df
+
+
+def load_all():
+    search = load_wide(PATHS["search"])
+    click = load_wide(PATHS["click"])
+
+    raw = pd.read_csv(PATHS["mention"], encoding="utf-8-sig")
+    mention = {}
+    for col_kr, prefix in MENTION_COLS.items():
+        p = raw.pivot(index="keyword", columns="date", values=col_kr)
+        p.columns = pd.to_datetime(p.columns)
+        mention[prefix] = p
+
+    return search, click, mention
+
+
+# ── nan fill ──────────────────────────────────────────────────────────────────
+
+def fill_sig(s):
+    return s.ffill().fillna(0.0).values.astype(np.float64)
+
+
+def _clip(val, kind):
+    lo, hi = CLIP[kind]
+    return float(np.clip(val, lo, hi))
+
+
+# ── RSI ───────────────────────────────────────────────────────────────────────
+
+def _rsi(arr, period=14):
+    if len(arr) < period + 1:
+        return 50.0
+    diffs = np.diff(arr[-(period + 1):])
+    gains = np.where(diffs > 0, diffs, 0)
+    losses = np.where(diffs < 0, -diffs, 0)
+    avg_gain = float(np.mean(gains))
+    avg_loss = float(np.mean(losses))
+    if avg_loss < EPS:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - 100.0 / (1.0 + rs)
+
+
+# ── signal features (39 per signal) ──────────────────────────────────────────
+
+def sig_feat(lb, p):
+    # lb: 60-day lookback, p: prefix
+    baseline = float(np.mean(lb))
+    f = {}
+
+    # A. Scale — 절대 규모 (5)
+    for n in W_FULL:
+        f[f"{p}_volume_{n}d"] = float(np.mean(lb[-n:]))
+
+    # B. Position — 상대 위치 (5)
+    for n in W_FULL:
+        f[f"{p}_level_{n}d"] = _clip(np.mean(lb[-n:]) / (baseline + EPS), "level")
+
+    # C. Momentum — 성장률 (5)
+    for n in W_FULL:
+        r, pr = lb[-n:], lb[-2 * n : -n]
+        f[f"{p}_growth_{n}d"] = _clip(np.mean(r) / (np.mean(pr) + EPS) - 1, "growth")
+
+    # D. Acceleration — 가속도 (3)
+    g = lambda n: f[f"{p}_growth_{n}d"]
+    f[f"{p}_accel_short"] = g(3) - g(7)
+    f[f"{p}_accel_mid"] = g(7) - g(14)
+    f[f"{p}_accel_long"] = g(14) - g(30)
+
+    # E. RSI (3)
+    for n in W_STAT:
+        f[f"{p}_rsi_{n}d"] = _rsi(lb, period=n)
+
+    # F. Shape — 분포 형태 (11)
+    for n in W_STAT:
+        w = lb[-n:]
+        s = float(np.std(w))
+        if s > 0:
+            z = (w - np.mean(w)) / s
+            f[f"{p}_skew_{n}d"] = float(np.mean(z ** 3))
+            f[f"{p}_kurt_{n}d"] = float(np.mean(z ** 4) - 3.0)
+        else:
+            f[f"{p}_skew_{n}d"] = 0.0
+            f[f"{p}_kurt_{n}d"] = 0.0
+    for n in W_FULL:
+        w = lb[-n:]
+        f[f"{p}_spikiness_{n}d"] = float(np.max(w)) / (float(np.mean(w)) + EPS)
+
+    # G. Stability — 안정성 (4)
+    for n in W_STAT:
+        w = lb[-n:]
+        f[f"{p}_cv_{n}d"] = _clip(np.std(w) / (np.mean(w) + EPS), "cv")
+    cv_recent = float(np.std(lb[-14:])) / (float(np.mean(lb[-14:])) + EPS)
+    cv_past = float(np.std(lb[:30])) / (float(np.mean(lb[:30])) + EPS)
+    f[f"{p}_cv_change"] = cv_recent - cv_past
+
+    # H. Lag — 과거 실제값 (5)
+    for n in [1, 3, 7, 14, 30]:
+        f[f"{p}_lag_{n}d"] = float(lb[-n]) / (baseline + EPS)
+
+    # I. Raw Std — 절대 변동 크기 (3)
+    for n in W_STAT:
+        f[f"{p}_std_{n}d"] = float(np.std(lb[-n:]))
+
+    # J. Position — 최근 피크 대비 위치 (5)
+    smooth = float(np.mean(lb[-3:]))
+    for n in W_FULL:
+        f[f"{p}_pos_{n}d"] = smooth / (float(np.max(lb[-n:])) + EPS)
+
+    # K. Peak Recency — 최고점 경과일 (1)
+    f[f"days_since_{p}_max_14d"] = 13 - int(np.argmax(lb[-14:]))
+
+    return f
+
+
+# ── cross features (8) ───────────────────────────────────────────────────────
+
+def cross_feat(sf, cf, pfs):
+    f = {}
+    s7 = sf["search_level_7d"]
+
+    f["click_search_ratio"] = _clip(cf["click_level_7d"] / (s7 + EPS), "ratio")
+    f["click_lead_7d"] = cf["click_growth_7d"] - sf["search_growth_7d"]
+    f["click_lead_14d"] = cf["click_growth_14d"] - sf["search_growth_14d"]
+    f["click_search_pos_gap"] = cf["click_level_7d"] - sf["search_level_7d"]
+
+    for pp, pf in pfs.items():
+        f[f"{pp}_lead_7d"] = pf[f"{pp}_growth_7d"] - sf["search_growth_7d"]
+        f[f"{pp}_search_ratio"] = _clip(pf[f"{pp}_level_7d"] / (s7 + EPS), "ratio")
+
+    return f
+
+
+# ── labels ────────────────────────────────────────────────────────────────────
+
+def compute_labels(s_lb, s_fw, c_lb, c_fw, plat_lbs, plat_fws):
+    mu = float(np.mean(s_lb))
+    sigma = float(np.std(s_lb))
+    fmax = float(np.max(s_fw))
+    delta = fmax - mu
+
+    # A. 기존 virality_score (z-score)
+    z = 0.0 if delta < MIN_ABS_CHANGE else delta / (sigma + EPS)
+
+    # B. concordance — 멀티시그널 동시 급등 (0~4)
+    concordance = 0
+    for lb, fw in [(s_lb, s_fw), (c_lb, c_fw)] + list(zip(plat_lbs, plat_fws)):
+        p75 = float(np.percentile(lb, 75))
+        if float(np.max(fw)) > p75 and p75 > 0:
+            concordance += 1
+
+    # C. sustained_breakout — 1주차 역대최고 + 2주차 유지 (0/1)
+    week1 = float(np.mean(s_fw[:7]))
+    week2 = float(np.mean(s_fw[7:]))
+    hist_max = float(np.max(s_lb))
+    sustained = int(week1 > hist_max and week2 > week1)
+
+    # D. trajectory_class — 미래 곡선 형태 (0~3)
+    # 0=spike_decay, 1=slow_build, 2=plateau, 3=volatile
+    peak_day = int(np.argmax(s_fw))
+    slope = float(np.polyfit(np.arange(FW), s_fw, 1)[0])
+    fw_cv = float(np.std(s_fw)) / (float(np.mean(s_fw)) + EPS)
+    if peak_day <= 4 and slope < 0:
+        traj = 0
+    elif slope > 0 and peak_day >= 10:
+        traj = 1
+    elif abs(slope) < float(np.mean(s_fw)) * 0.01 and fw_cv < 0.3:
+        traj = 2
+    else:
+        traj = 3
+
+    # E. click_weighted_lift — 클릭 가중 검색 상승
+    c_fw_mean = float(np.mean(c_fw))
+    c_weight = c_fw / (c_fw_mean + EPS) if c_fw_mean > 0 else np.ones_like(c_fw)
+    s_lb_mean = float(np.mean(s_lb))
+    c_lb_mean = float(np.mean(c_lb))
+    lift = float(np.mean(s_fw * c_weight)) / (s_lb_mean * c_lb_mean + EPS) if s_lb_mean > 0 and c_lb_mean > 0 else 0.0
+
+    return {
+        "virality_score": round(z, 6),
+        "concordance": concordance,
+        "sustained_breakout": sustained,
+        "trajectory_class": traj,
+        "click_weighted_lift": round(lift, 6),
+        # viral_percentile은 main()에서 후처리
+        "future_ratio": round(fmax / (mu + EPS), 6),
+    }
+
+
+# ── single row ────────────────────────────────────────────────────────────────
+
+def compute(s, c, plats, t, s_inv):
+    lo, hi = t - LB, t + FW
+
+    if lo < 0 or hi > len(s):
+        return None
+    if s_inv[lo:lo + 30].all():
+        return None
+
+    s_lb, s_fw = s[lo:t], s[t:hi]
+    c_lb, c_fw = c[lo:t], c[t:hi]
+    if float(np.std(s_lb)) == 0:
+        return None
+
+    sf = sig_feat(s_lb, "search")
+    cf = sig_feat(c_lb, "click")
+    pfs = {p: sig_feat(a[lo:t], p) for p, a in plats.items()}
+
+    row = {}
+    row.update(sf)
+    row.update(cf)
+    for pf in pfs.values():
+        row.update(pf)
+    row.update(cross_feat(sf, cf, pfs))
+
+    # surge 피처 — blog/instagram 선행 신호 (6개)
+    s_base_30 = float(np.mean(s_lb[:30]))
+    for pp in ["blog", "instagram"]:
+        if pp not in plats:
+            row[f"{pp}_surge_7d"] = 0
+            row[f"{pp}_surge_days_ago"] = -1
+            row[f"{pp}_surge_before_search"] = 0
+            continue
+        p_lb = plats[pp][lo:t]
+        p_base = float(np.mean(p_lb[:30]))
+
+        # 최근 7일 내 baseline 2배 돌파 여부
+        surge_mask = p_lb[-7:] > p_base * 2 if p_base > 0 else np.zeros(7, dtype=bool)
+        row[f"{pp}_surge_7d"] = int(surge_mask.any())
+
+        # 최근 14일 내 2배 돌파 최초 시점 (경과일)
+        cross_idx = np.where(p_lb[-14:] > p_base * 2)[0] if p_base > 0 else np.array([])
+        row[f"{pp}_surge_days_ago"] = int(14 - cross_idx[0]) if len(cross_idx) > 0 else -1
+
+        # blog/insta 2배 돌파 + search 아직 안 넘음
+        s_surged = (s_lb[-7:] > s_base_30 * 2).any() if s_base_30 > 0 else False
+        row[f"{pp}_surge_before_search"] = int(surge_mask.any() and not s_surged)
+
+    # calendar
+    row["day_of_week"] = t  # placeholder
+    row["month"] = t        # placeholder
+
+    # 라벨 — 모든 시그널의 forward 데이터 전달
+    plat_lbs = [plats[p][lo:t] for p in ["blog", "instagram"] if p in plats]
+    plat_fws = [plats[p][t:hi] for p in ["blog", "instagram"] if p in plats]
+    row.update(compute_labels(s_lb, s_fw, c_lb, c_fw, plat_lbs, plat_fws))
+    return row
+
+
+# ── column order ──────────────────────────────────────────────────────────────
+
+def _sig_cols(p):
+    c = []
+    for n in W_FULL:    c.append(f"{p}_volume_{n}d")
+    for n in W_FULL:    c.append(f"{p}_level_{n}d")
+    for n in W_FULL:    c.append(f"{p}_growth_{n}d")
+    c += [f"{p}_accel_short", f"{p}_accel_mid", f"{p}_accel_long"]
+    for n in W_STAT:    c.append(f"{p}_rsi_{n}d")
+    for n in W_STAT:    c.append(f"{p}_skew_{n}d")
+    for n in W_STAT:    c.append(f"{p}_kurt_{n}d")
+    for n in W_FULL:    c.append(f"{p}_spikiness_{n}d")
+    for n in W_STAT:    c.append(f"{p}_cv_{n}d")
+    c.append(f"{p}_cv_change")
+    for n in [1, 3, 7, 14, 30]: c.append(f"{p}_lag_{n}d")
+    for n in W_STAT:    c.append(f"{p}_std_{n}d")
+    for n in W_FULL:    c.append(f"{p}_pos_{n}d")
+    c.append(f"days_since_{p}_max_14d")
+    return c
+
+
+FEAT_COLS = []
+for _p in SIGNALS:
+    FEAT_COLS += _sig_cols(_p)
+
+FEAT_COLS += [
+    "click_search_ratio", "click_lead_7d", "click_lead_14d", "click_search_pos_gap",
+    "blog_lead_7d", "blog_search_ratio",
+    "instagram_lead_7d", "instagram_search_ratio",
+]
+FEAT_COLS += [
+    "blog_surge_7d", "blog_surge_days_ago", "blog_surge_before_search",
+    "instagram_surge_7d", "instagram_surge_days_ago", "instagram_surge_before_search",
+]
+FEAT_COLS += ["day_of_week", "month"]
+
+LABEL_COLS = [
+    "virality_score", "concordance", "sustained_breakout",
+    "trajectory_class", "click_weighted_lift", "future_ratio",
+]
+assert len(FEAT_COLS) == 216, f"expected 216, got {len(FEAT_COLS)}"
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    print("=" * 50)
+    print("building dataset (216 features)")
+    print("=" * 50)
+
+    search, click, mention = load_all()
+
+    kws = search.index.intersection(click.index)
+    dates = search.columns.intersection(click.columns).sort_values()
+
+    mask = (dates >= START) & (dates <= END)
+    pred_idx = np.where(mask)[0]
+    mention_kws = set(next(iter(mention.values())).index)
+
+    print(f"  {len(kws)} keywords, {len(dates)} days, {len(pred_idx)} pred dates")
+    print(f"  mention: {len(kws.intersection(mention_kws))}/{len(kws)}")
+
+    rows, skipped = [], 0
+
+    for i, kw in enumerate(kws, 1):
+        if i % 100 == 0 or i == len(kws):
+            print(f"  {i}/{len(kws)} ({len(rows):,} samples)")
+
+        sr = search.loc[kw, dates]
+        s_inv = (sr.isna() | (sr == 0)).values
+        s = fill_sig(sr)
+        c = fill_sig(click.loc[kw, dates])
+
+        plats = {}
+        for pfx, mdf in mention.items():
+            if kw in mdf.index:
+                plats[pfx] = fill_sig(mdf.loc[kw].reindex(dates))
+            else:
+                plats[pfx] = np.zeros(len(dates), dtype=np.float64)
+
+        for ti in pred_idx:
+            r = compute(s, c, plats, ti, s_inv)
+            if r is None:
+                skipped += 1
+                continue
+            r["keyword"] = kw
+            dt = dates[ti]
+            r["date"] = dt.date()
+            r["day_of_week"] = dt.dayofweek
+            r["month"] = dt.month
+            rows.append(r)
+
+    print(f"\n  {len(rows):,} samples ({skipped:,} skipped)")
+
+    df = pd.DataFrame(rows)
+
+    # viral_percentile — 같은 날짜 키워드 간 상대 순위
+    df["viral_percentile"] = df.groupby("date")["future_ratio"].rank(pct=True) * 100
+    df["viral_percentile"] = df["viral_percentile"].round(2)
+    ALL_LABELS = LABEL_COLS + ["viral_percentile"]
+
+    df = df[["keyword", "date"] + FEAT_COLS + ALL_LABELS]
+    df.sort_values(["keyword", "date"], inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    out = _out_path()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out, index=False, encoding="utf-8-sig")
+    print(f"  saved: {out}")
+
+    print(f"\n  shape: {df.shape}")
+    for label in ALL_LABELS:
+        print(f"  {label}: mean={df[label].mean():.4f}  std={df[label].std():.4f}  min={df[label].min():.2f}  max={df[label].max():.2f}")
+
+    nans = df[FEAT_COLS + ALL_LABELS].isna().sum()
+    bad = nans[nans > 0]
+    print(f"\n  {'[WARN] NaN: ' + str(bad.to_dict()) if len(bad) else '[OK] no NaN'}")
+
+
+if __name__ == "__main__":
+    main()
