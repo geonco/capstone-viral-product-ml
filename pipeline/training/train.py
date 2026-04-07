@@ -122,8 +122,18 @@ def evaluate_clf(y_true, y_pred, split: str, target: str) -> dict:
     return {"split": split, "target": target, "accuracy": acc, "f1_macro": f1}
 
 
+# ── 날짜 기반 서브샘플링 ─────────────────────────────────────────────────────
+def _subsample_by_date(df, stride):
+    # stride일 간격으로 날짜 추출, 해당 날짜의 모든 키워드 유지
+    if stride <= 1:
+        return df
+    dates = np.sort(df[DATE_COL].unique())
+    keep_dates = dates[::stride]
+    return df[df[DATE_COL].isin(keep_dates)]
+
+
 # ── 데이터 분할 ───────────────────────────────────────────────────────────────
-def split_data(df: pd.DataFrame):
+def split_data(df: pd.DataFrame, train_stride: int = 1):
     if DATE_COL not in df.columns:
         print("날짜 컬럼 없음 → 랜덤 분할")
         train, tmp  = train_test_split(df, test_size=1 - TRAIN_RATIO, random_state=42)
@@ -151,11 +161,18 @@ def split_data(df: pd.DataFrame):
     valid = df[(df[DATE_COL] >= valid_start) & (df[DATE_COL] <= valid_end)]
     test  = df[df[DATE_COL] >= test_start]
 
+    # train/valid만 서브샘플링, test는 stride=1 유지
+    if train_stride > 1:
+        train = _subsample_by_date(train, train_stride)
+        valid = _subsample_by_date(valid, train_stride)
+
     print(f"  train: ~{train[DATE_COL].min().date()} ~ {train[DATE_COL].max().date()} ({len(train):,})")
     print(f"  gap: {GAP_DAYS}일")
     print(f"  valid: ~{valid[DATE_COL].min().date()} ~ {valid[DATE_COL].max().date()} ({len(valid):,})")
     print(f"  gap: {GAP_DAYS}일")
     print(f"  test:  ~{test[DATE_COL].min().date()} ~ {test[DATE_COL].max().date()} ({len(test):,})")
+    if train_stride > 1:
+        print(f"  train/valid stride: {train_stride}일 (test는 stride=1)")
     return train, valid, test
 
 
@@ -322,7 +339,7 @@ def run_model(
 
 
 # ── 메인 ──────────────────────────────────────────────────────────────────────
-def main(csv_path: str, target: str, do_tune: bool, n_trials: int):
+def main(csv_path: str, target: str, do_tune: bool, n_trials: int, train_stride: int = 3):
     dirs = _make_run_dir(target)
     print(f"output → {os.path.dirname(dirs['figures'])}")
     print(f"target: {target}")
@@ -330,7 +347,7 @@ def main(csv_path: str, target: str, do_tune: bool, n_trials: int):
     df = load_csv(csv_path)
     print(f"shape: {df.shape}")
 
-    train_df, valid_df, test_df = split_data(df)
+    train_df, valid_df, test_df = split_data(df, train_stride=train_stride)
     print(f"train={len(train_df)}  valid={len(valid_df)}  test={len(test_df)}")
     print(f"features: {len(FEAT_COLS)}")
 
@@ -401,8 +418,8 @@ def main(csv_path: str, target: str, do_tune: bool, n_trials: int):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--data", type=str, default="data/processed/dataset_20260403.csv",
-        help="216피처 + 라벨 CSV 경로",
+        "--data", type=str, default=None,
+        help="271피처 + 라벨 CSV 경로 (미지정 시 data/processed/ 내 최신 파일)",
     )
     parser.add_argument(
         "--target", type=str, default="buzz_rank",
@@ -420,10 +437,24 @@ if __name__ == "__main__":
         "--gpu", action="store_true",
         help="GPU 학습 활성화 (CUDA 필요)",
     )
+    parser.add_argument(
+        "--train-stride", type=int, default=3,
+        help="train/valid 서브샘플링 간격 (test는 항상 stride=1, 기본값: 3)",
+    )
     args = parser.parse_args()
     if args.gpu:
         DEFAULT_PARAMS["device"] = "cuda"
         print("GPU mode enabled")
+
+    # --data 미지정 시 최신 dataset 자동 선택
+    csv_path = args.data
+    if csv_path is None:
+        import glob
+        candidates = sorted(glob.glob(os.path.join(_ROOT, "data", "processed", "dataset_*.csv")))
+        if not candidates:
+            parser.error("data/processed/에 dataset_*.csv 파일 없음. --data로 경로 지정 필요")
+        csv_path = candidates[-1]
+        print(f"auto-selected: {csv_path}")
 
     ALL_TARGETS = [
         # v1
@@ -435,4 +466,4 @@ if __name__ == "__main__":
     ]
     targets = ALL_TARGETS if args.target == "all" else [args.target]
     for t in targets:
-        main(args.data, t, args.tune, args.n_trials)
+        main(csv_path, t, args.tune, args.n_trials, args.train_stride)
