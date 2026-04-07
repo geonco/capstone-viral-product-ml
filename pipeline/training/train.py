@@ -37,7 +37,6 @@ CLASSIFICATION_TARGETS = {"trajectory_class"}
 TARGET_CONFIG = {
     "future_intensity":        {"log": True},
     "future_acceleration":     {"log": False},
-    "peak_timing":             {"log": False},
     "signal_agreement":        {"log": False},
     "trajectory_class":        {"log": False, "num_class": 4},
     "search_click_convergence":{"log": False},
@@ -370,7 +369,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--target", type=str, default="future_intensity",
-        help="학습 타겟 (future_intensity, future_acceleration, peak_timing, signal_agreement, trajectory_class, search_click_convergence, all)",
+        help="학습 타겟 (future_intensity, future_acceleration, signal_agreement, trajectory_class, search_click_convergence, all)",
     )
     parser.add_argument(
         "--tune", action="store_true",
@@ -390,7 +389,7 @@ if __name__ == "__main__":
         print("GPU mode enabled")
 
     ALL_TARGETS = [
-        "future_intensity", "future_acceleration", "peak_timing",
+        "future_intensity", "future_acceleration",
         "signal_agreement", "trajectory_class", "search_click_convergence",
     ]
     targets = ALL_TARGETS if args.target == "all" else [args.target]

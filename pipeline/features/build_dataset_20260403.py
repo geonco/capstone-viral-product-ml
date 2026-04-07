@@ -186,10 +186,7 @@ def compute_labels(s_fw, c_fw, b_fw, i_fw):
     accel = (w2 - w1) / (w1 + EPS)
     accel = float(np.clip(accel, -1, 10))
 
-    # C. peak_timing — 검색 피크 시점 (0=즉시, 1=후반)
-    timing = int(np.argmax(s_fw)) / 13.0
-
-    # D. signal_agreement — 비영 시그널 간 pairwise 상관계수 평균
+    # C. signal_agreement — 비영 시그널 간 pairwise 상관계수 평균
     sigs = [arr for arr in [s_fw, c_fw, b_fw, i_fw] if float(np.mean(arr)) > EPS]
     if len(sigs) >= 2:
         corr_mat = np.corrcoef(sigs)
@@ -199,7 +196,7 @@ def compute_labels(s_fw, c_fw, b_fw, i_fw):
     else:
         agreement = 0.0
 
-    # E. trajectory_class — 미래 곡선 형태 (0~3)
+    # D. trajectory_class — 미래 곡선 형태 (0~3)
     # 0=spike_decay, 1=slow_build, 2=plateau, 3=volatile
     peak_day = int(np.argmax(s_fw))
     slope = float(np.polyfit(np.arange(FW), s_fw, 1)[0])
@@ -213,7 +210,7 @@ def compute_labels(s_fw, c_fw, b_fw, i_fw):
     else:
         traj = 3
 
-    # F. search_click_convergence — 검색↔클릭 min-max 정규화 후 상관계수
+    # E. search_click_convergence — 검색↔클릭 min-max 정규화 후 상관계수
     s_range = float(np.max(s_fw) - np.min(s_fw))
     c_range = float(np.max(c_fw) - np.min(c_fw))
     if s_range > EPS and c_range > EPS:
@@ -228,7 +225,6 @@ def compute_labels(s_fw, c_fw, b_fw, i_fw):
     return {
         "future_intensity": round(intensity, 6),
         "future_acceleration": round(accel, 6),
-        "peak_timing": round(timing, 6),
         "signal_agreement": round(agreement, 6),
         "trajectory_class": traj,
         "search_click_convergence": round(conv, 6),
@@ -332,7 +328,7 @@ FEAT_COLS += [
 FEAT_COLS += ["day_of_week", "month"]
 
 LABEL_COLS = [
-    "future_intensity", "future_acceleration", "peak_timing",
+    "future_intensity", "future_acceleration",
     "signal_agreement", "trajectory_class", "search_click_convergence",
 ]
 assert len(FEAT_COLS) == 216, f"expected 216, got {len(FEAT_COLS)}"

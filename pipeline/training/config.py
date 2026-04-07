@@ -41,7 +41,7 @@ FEAT_COLS += [
 FEAT_COLS += ["day_of_week", "month"]
 
 LABEL_COLS = [
-    "future_intensity", "future_acceleration", "peak_timing",
+    "future_intensity", "future_acceleration",
     "signal_agreement", "trajectory_class", "search_click_convergence",
 ]
 META_COLS = ["keyword", "date"]
