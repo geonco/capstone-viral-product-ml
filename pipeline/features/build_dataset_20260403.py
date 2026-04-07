@@ -337,7 +337,26 @@ assert len(FEAT_COLS) == 216, f"expected 216, got {len(FEAT_COLS)}"
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
+def _process_keyword(args):
+    kw, s_arr, c_arr, plats, pred_idx, dates, s_inv = args
+    rows, skipped = [], 0
+    for ti in pred_idx:
+        r = compute(s_arr, c_arr, plats, ti, s_inv)
+        if r is None:
+            skipped += 1
+            continue
+        r["keyword"] = kw
+        dt = dates[ti]
+        r["date"] = dt.date()
+        r["day_of_week"] = dt.dayofweek
+        r["month"] = dt.month
+        rows.append(r)
+    return rows, skipped
+
+
 def main():
+    from multiprocessing import Pool, cpu_count
+
     print("=" * 50)
     print("building dataset (216 features)")
     print("=" * 50)
@@ -351,42 +370,41 @@ def main():
     pred_idx = np.where(mask)[0]
     mention_kws = set(next(iter(mention.values())).index)
 
+    n_workers = max(1, cpu_count() - 1)
     print(f"  {len(kws)} keywords, {len(dates)} days, {len(pred_idx)} pred dates")
     print(f"  mention: {len(kws.intersection(mention_kws))}/{len(kws)}")
+    print(f"  workers: {n_workers}")
 
-    rows, skipped = [], 0
+    # 키워드별 인자를 제너레이터로 생성 (메모리 선적재 방지)
+    def gen_tasks():
+        for kw in kws:
+            sr = search.loc[kw, dates]
+            s_inv = (sr.isna() | (sr == 0)).values
+            s = fill_sig(sr)
+            c = fill_sig(click.loc[kw, dates])
 
-    for i, kw in enumerate(kws, 1):
-        if i % 100 == 0 or i == len(kws):
-            print(f"  {i}/{len(kws)} ({len(rows):,} samples)")
+            plats = {}
+            for pfx, mdf in mention.items():
+                if kw in mdf.index:
+                    plats[pfx] = fill_sig(mdf.loc[kw].reindex(dates))
+                else:
+                    plats[pfx] = np.zeros(len(dates), dtype=np.float64)
 
-        sr = search.loc[kw, dates]
-        s_inv = (sr.isna() | (sr == 0)).values
-        s = fill_sig(sr)
-        c = fill_sig(click.loc[kw, dates])
+            yield (kw, s, c, plats, pred_idx, dates, s_inv)
 
-        plats = {}
-        for pfx, mdf in mention.items():
-            if kw in mdf.index:
-                plats[pfx] = fill_sig(mdf.loc[kw].reindex(dates))
-            else:
-                plats[pfx] = np.zeros(len(dates), dtype=np.float64)
+    chunks, total, skipped = [], 0, 0
+    with Pool(n_workers, maxtasksperchild=50) as pool:
+        for i, (kw_rows, kw_skipped) in enumerate(pool.imap_unordered(_process_keyword, gen_tasks(), chunksize=10), 1):
+            if kw_rows:
+                chunks.append(pd.DataFrame(kw_rows))
+                total += len(kw_rows)
+            skipped += kw_skipped
+            print(f"  {i}/{len(kws)} ({total:,} samples)")
 
-        for ti in pred_idx:
-            r = compute(s, c, plats, ti, s_inv)
-            if r is None:
-                skipped += 1
-                continue
-            r["keyword"] = kw
-            dt = dates[ti]
-            r["date"] = dt.date()
-            r["day_of_week"] = dt.dayofweek
-            r["month"] = dt.month
-            rows.append(r)
+    print(f"\n  {total:,} samples ({skipped:,} skipped)")
 
-    print(f"\n  {len(rows):,} samples ({skipped:,} skipped)")
-
-    df = pd.DataFrame(rows)
+    df = pd.concat(chunks, ignore_index=True)
+    del chunks
 
     # viral_percentile — 같은 날짜 키워드 간 상대 순위
     df["viral_percentile"] = df.groupby("date")["future_ratio"].rank(pct=True) * 100
