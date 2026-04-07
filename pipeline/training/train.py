@@ -32,6 +32,7 @@ DATE_COL = "date"
 
 TRAIN_RATIO = 0.70
 VALID_RATIO = 0.15
+GAP_DAYS = 74  # LB(60) + FW(14), train↔valid↔test 간 누수 방지
 
 CLASSIFICATION_TARGETS = {"trajectory_class"}
 TARGET_CONFIG = {
@@ -95,6 +96,16 @@ def evaluate(y_true, y_pred, split: str, target: str) -> dict:
     rmse = rmse_score(y_true, y_pred)
     mae  = float(mean_absolute_error(y_true, y_pred))
     print(f"  [{split:5s}] {target}  RMSE={rmse:.4f}  MAE={mae:.4f}")
+
+    # test set에서 naive baseline 비교
+    if split == "test":
+        y_arr = np.array(y_true)
+        bl_mean = float(mean_absolute_error(y_arr, np.full_like(y_arr, y_arr.mean())))
+        bl_zero = float(mean_absolute_error(y_arr, np.zeros_like(y_arr)))
+        best_bl = min(bl_mean, bl_zero)
+        gain = (1 - mae / best_bl) * 100 if best_bl > 0 else 0
+        print(f"         baseline MAE: mean={bl_mean:.4f} zero={bl_zero:.4f} → gain: {gain:+.1f}%")
+
     return {"split": split, "target": target, "rmse": rmse, "mae": mae}
 
 
@@ -107,19 +118,39 @@ def evaluate_clf(y_true, y_pred, split: str, target: str) -> dict:
 
 # ── 데이터 분할 ───────────────────────────────────────────────────────────────
 def split_data(df: pd.DataFrame):
-    if DATE_COL in df.columns:
-        print(f"'{DATE_COL}' 컬럼 감지 → 시계열 순서 기반 분할")
-        df = df.sort_values(DATE_COL).reset_index(drop=True)
-        n  = len(df)
-        t1 = int(n * TRAIN_RATIO)
-        t2 = int(n * (TRAIN_RATIO + VALID_RATIO))
-        return df.iloc[:t1], df.iloc[t1:t2], df.iloc[t2:]
-    else:
+    if DATE_COL not in df.columns:
         print("날짜 컬럼 없음 → 랜덤 분할")
         train, tmp  = train_test_split(df, test_size=1 - TRAIN_RATIO, random_state=42)
         val_ratio   = VALID_RATIO / (1 - TRAIN_RATIO)
         valid, test = train_test_split(tmp, test_size=1 - val_ratio, random_state=42)
         return train, valid, test
+
+    print(f"시계열 분할 (gap={GAP_DAYS}일)")
+    df = df.copy()
+    df[DATE_COL] = pd.to_datetime(df[DATE_COL])
+    df = df.sort_values(DATE_COL).reset_index(drop=True)
+
+    dates = np.sort(df[DATE_COL].unique())
+    n = len(dates)
+    train_end = dates[int(n * TRAIN_RATIO)]
+    valid_start = train_end + pd.Timedelta(days=GAP_DAYS)
+
+    remaining = dates[dates >= valid_start]
+    if len(remaining) == 0:
+        raise ValueError("gap 적용 후 valid/test 데이터 없음")
+    valid_end = remaining[int(len(remaining) * 0.5)]
+    test_start = valid_end + pd.Timedelta(days=GAP_DAYS)
+
+    train = df[df[DATE_COL] <= train_end]
+    valid = df[(df[DATE_COL] >= valid_start) & (df[DATE_COL] <= valid_end)]
+    test  = df[df[DATE_COL] >= test_start]
+
+    print(f"  train: ~{train[DATE_COL].min().date()} ~ {train[DATE_COL].max().date()} ({len(train):,})")
+    print(f"  gap: {GAP_DAYS}일")
+    print(f"  valid: ~{valid[DATE_COL].min().date()} ~ {valid[DATE_COL].max().date()} ({len(valid):,})")
+    print(f"  gap: {GAP_DAYS}일")
+    print(f"  test:  ~{test[DATE_COL].min().date()} ~ {test[DATE_COL].max().date()} ({len(test):,})")
+    return train, valid, test
 
 
 # ── Optuna TPE 튜닝 ───────────────────────────────────────────────────────────
