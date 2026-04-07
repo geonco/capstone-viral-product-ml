@@ -177,44 +177,79 @@ def cross_feat(sf, cf, pfs):
 
 # ── labels ────────────────────────────────────────────────────────────────────
 
-def compute_labels(s_fw, c_fw, b_fw, i_fw):
-    # A. future_intensity — 4채널 합산 버즈 볼륨
+def compute_labels(s_fw, c_fw, b_fw, i_fw, s_lb, c_lb, b_lb, i_lb, kw_stats=None):
+    # A. buzz_composite — 4채널 z-score 가중 합산 (buzz_rank는 main에서 후처리)
+    sigs_fw = {"search": s_fw, "click": c_fw, "blog": b_fw, "instagram": i_fw}
+    sigs_lb = {"search": s_lb, "click": c_lb, "blog": b_lb, "instagram": i_lb}
+    weights = {"search": 0.4, "click": 0.3, "blog": 0.2, "instagram": 0.1}
+
+    composite = 0.0
+    for sig, w in weights.items():
+        mu = float(np.mean(sigs_lb[sig]))
+        sigma = float(np.std(sigs_lb[sig]))
+        fw_mean = float(np.mean(sigs_fw[sig]))
+        z = (fw_mean - mu) / (sigma + EPS) if sigma > EPS else 0.0
+        composite += w * z
+
+    # B. momentum_score — 4채널 가중 가속도 (-1~1)
+    accel_sum, w_sum = 0.0, 0.0
+    for sig, w in weights.items():
+        w1 = float(np.mean(sigs_fw[sig][:7]))
+        w2 = float(np.mean(sigs_fw[sig][7:]))
+        denom = max(w1, w2)
+        if denom > EPS:
+            accel = (w2 - w1) / (denom + EPS)
+            accel_sum += w * accel
+            w_sum += w
+    momentum = accel_sum / (w_sum + EPS) if w_sum > 0 else 0.0
+    momentum = float(np.clip(momentum, -1, 1))
+
+    # C. channel_breadth — 활성 채널 수 (0~4)
+    breadth = 0
+    for sig in ["search", "click", "blog", "instagram"]:
+        baseline = float(np.median(sigs_lb[sig]))
+        if float(np.mean(sigs_fw[sig])) > baseline and baseline > EPS:
+            breadth += 1
+
+    # D. conversion_shift — 구매 전환율 변화 (z-score)
+    awareness_fw = float(np.mean(s_fw)) + float(np.mean(b_fw)) + float(np.mean(i_fw))
+    action_fw = float(np.mean(c_fw))
+    ratio_fw = action_fw / (awareness_fw + EPS) if awareness_fw > EPS else 0.0
+
+    awareness_lb = float(np.mean(s_lb)) + float(np.mean(b_lb)) + float(np.mean(i_lb))
+    action_lb = float(np.mean(c_lb))
+    ratio_lb = action_lb / (awareness_lb + EPS) if awareness_lb > EPS else 0.0
+
+    # lookback 내 ratio의 변동으로 z-score 근사
+    ratio_diff = ratio_fw - ratio_lb
+    conv_shift = ratio_diff / (abs(ratio_lb) + EPS) if abs(ratio_lb) > EPS else 0.0
+    conv_shift = float(np.clip(conv_shift, -5, 5))
+
+    # ── 기존 라벨 (v1) ──
+
+    # future_intensity — 4채널 합산 버즈 볼륨
     intensity = float(np.mean(s_fw) + np.mean(c_fw) + np.mean(b_fw) + np.mean(i_fw))
 
-    # B. future_acceleration — 검색 week2/week1 성장률
-    w1 = float(np.mean(s_fw[:7]))
-    w2 = float(np.mean(s_fw[7:]))
-    accel = (w2 - w1) / (w1 + EPS)
-    accel = float(np.clip(accel, -1, 10))
+    # future_acceleration — 검색 week2/week1 성장률
+    fa_w1 = float(np.mean(s_fw[:7]))
+    fa_w2 = float(np.mean(s_fw[7:]))
+    fa_accel = (fa_w2 - fa_w1) / (fa_w1 + EPS)
+    fa_accel = float(np.clip(fa_accel, -1, 10))
 
-    # C. signal_agreement — 비영·비상수 시그널 간 pairwise 상관계수 평균
-    sigs = [arr for arr in [s_fw, c_fw, b_fw, i_fw]
-            if float(np.mean(arr)) > EPS and float(np.std(arr)) > EPS]
-    if len(sigs) >= 2:
-        corr_mat = np.corrcoef(sigs)
-        n = len(sigs)
-        pairs = [corr_mat[i, j] for i in range(n) for j in range(i + 1, n)]
+    # signal_agreement — 비영·비상수 시그널 간 pairwise 상관계수 평균
+    sigs_list = [arr for arr in [s_fw, c_fw, b_fw, i_fw]
+                 if float(np.mean(arr)) > EPS and float(np.std(arr)) > EPS]
+    if len(sigs_list) >= 2:
+        corr_mat = np.corrcoef(sigs_list)
+        n_sigs = len(sigs_list)
+        pairs = [corr_mat[i, j] for i in range(n_sigs) for j in range(i + 1, n_sigs)]
         agreement = float(np.nanmean(pairs))
         if np.isnan(agreement):
             agreement = 0.0
     else:
         agreement = 0.0
 
-    # D. trajectory_class — 미래 곡선 형태 (0~3)
-    # 0=spike_decay, 1=slow_build, 2=plateau, 3=volatile
-    peak_day = int(np.argmax(s_fw))
-    slope = float(np.polyfit(np.arange(FW), s_fw, 1)[0])
-    fw_cv = float(np.std(s_fw)) / (float(np.mean(s_fw)) + EPS)
-    if peak_day <= 4 and slope < 0:
-        traj = 0
-    elif slope > 0 and peak_day >= 10:
-        traj = 1
-    elif abs(slope) < float(np.mean(s_fw)) * 0.01 and fw_cv < 0.3:
-        traj = 2
-    else:
-        traj = 3
-
-    # E. search_click_convergence — 검색↔클릭 min-max 정규화 후 상관계수
+    # search_click_convergence — 검색↔클릭 min-max 정규화 후 상관계수
     s_range = float(np.max(s_fw) - np.min(s_fw))
     c_range = float(np.max(c_fw) - np.min(c_fw))
     if s_range > EPS and c_range > EPS:
@@ -227,11 +262,16 @@ def compute_labels(s_fw, c_fw, b_fw, i_fw):
         conv = 0.0
 
     return {
+        # v1 라벨
         "future_intensity": round(intensity, 6),
-        "future_acceleration": round(accel, 6),
+        "future_acceleration": round(fa_accel, 6),
         "signal_agreement": round(agreement, 6),
-        "trajectory_class": traj,
         "search_click_convergence": round(conv, 6),
+        # v2 라벨
+        "buzz_composite": round(composite, 6),
+        "momentum_score": round(momentum, 6),
+        "channel_breadth": breadth,
+        "conversion_shift": round(conv_shift, 6),
     }
 
 
@@ -288,10 +328,12 @@ def compute(s, c, plats, t, s_inv):
     row["day_of_week"] = t  # placeholder
     row["month"] = t        # placeholder
 
-    # 라벨 — 미래 14일 데이터만 사용
+    # 라벨 — 미래 + 과거 데이터 사용
+    b_lb = plats["blog"][lo:t] if "blog" in plats else np.zeros(LB, dtype=np.float64)
     b_fw = plats["blog"][t:hi] if "blog" in plats else np.zeros(FW, dtype=np.float64)
+    i_lb = plats["instagram"][lo:t] if "instagram" in plats else np.zeros(LB, dtype=np.float64)
     i_fw = plats["instagram"][t:hi] if "instagram" in plats else np.zeros(FW, dtype=np.float64)
-    row.update(compute_labels(s_fw, c_fw, b_fw, i_fw))
+    row.update(compute_labels(s_fw, c_fw, b_fw, i_fw, s_lb, c_lb, b_lb, i_lb))
     return row
 
 
@@ -332,8 +374,12 @@ FEAT_COLS += [
 FEAT_COLS += ["day_of_week", "month"]
 
 LABEL_COLS = [
+    # v1
     "future_intensity", "future_acceleration",
-    "signal_agreement", "trajectory_class", "search_click_convergence",
+    "signal_agreement", "search_click_convergence",
+    # v2
+    "buzz_composite", "momentum_score",
+    "channel_breadth", "conversion_shift",
 ]
 assert len(FEAT_COLS) == 216, f"expected 216, got {len(FEAT_COLS)}"
 
@@ -416,8 +462,11 @@ def main():
     df = pd.concat(chunks, ignore_index=True)
     del chunks
 
-    ALL_LABELS = LABEL_COLS
+    # buzz_rank — 날짜별 buzz_composite 백분위 (0~100)
+    df["buzz_rank"] = df.groupby("date")["buzz_composite"].rank(pct=True) * 100
+    df["buzz_rank"] = df["buzz_rank"].round(2)
 
+    ALL_LABELS = LABEL_COLS + ["buzz_rank"]
     df = df[["keyword", "date"] + FEAT_COLS + ALL_LABELS]
     df.sort_values(["keyword", "date"], inplace=True)
     df.reset_index(drop=True, inplace=True)

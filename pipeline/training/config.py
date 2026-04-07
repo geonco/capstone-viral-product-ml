@@ -41,8 +41,13 @@ FEAT_COLS += [
 FEAT_COLS += ["day_of_week", "month"]
 
 LABEL_COLS = [
+    # v1
     "future_intensity", "future_acceleration",
-    "signal_agreement", "trajectory_class", "search_click_convergence",
+    "signal_agreement", "search_click_convergence",
+    # v2
+    "buzz_composite", "momentum_score",
+    "channel_breadth", "conversion_shift",
+    "buzz_rank",
 ]
 META_COLS = ["keyword", "date"]
 ALL_COLS = META_COLS + FEAT_COLS + LABEL_COLS

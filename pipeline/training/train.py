@@ -34,13 +34,19 @@ TRAIN_RATIO = 0.70
 VALID_RATIO = 0.15
 GAP_DAYS = 74  # LB(60) + FW(14), train↔valid↔test 간 누수 방지
 
-CLASSIFICATION_TARGETS = {"trajectory_class"}
+CLASSIFICATION_TARGETS = {"channel_breadth"}
 TARGET_CONFIG = {
+    # v1
     "future_intensity":        {"log": True},
     "future_acceleration":     {"log": False},
     "signal_agreement":        {"log": False},
-    "trajectory_class":        {"log": False, "num_class": 4},
     "search_click_convergence":{"log": False},
+    # v2
+    "buzz_composite":     {"log": False},
+    "buzz_rank":          {"log": False},
+    "momentum_score":     {"log": False},
+    "channel_breadth":    {"log": False, "num_class": 5},
+    "conversion_shift":   {"log": False},
 }
 
 DEFAULT_PARAMS = {
@@ -399,8 +405,8 @@ if __name__ == "__main__":
         help="216피처 + 라벨 CSV 경로",
     )
     parser.add_argument(
-        "--target", type=str, default="future_intensity",
-        help="학습 타겟 (future_intensity, future_acceleration, signal_agreement, trajectory_class, search_click_convergence, all)",
+        "--target", type=str, default="buzz_rank",
+        help="학습 타겟 (v1: future_intensity, future_acceleration, signal_agreement, search_click_convergence / v2: buzz_rank, momentum_score, channel_breadth, conversion_shift / all)",
     )
     parser.add_argument(
         "--tune", action="store_true",
@@ -420,8 +426,12 @@ if __name__ == "__main__":
         print("GPU mode enabled")
 
     ALL_TARGETS = [
+        # v1
         "future_intensity", "future_acceleration",
-        "signal_agreement", "trajectory_class", "search_click_convergence",
+        "signal_agreement", "search_click_convergence",
+        # v2
+        "buzz_rank", "momentum_score",
+        "channel_breadth", "conversion_shift",
     ]
     targets = ALL_TARGETS if args.target == "all" else [args.target]
     for t in targets:
