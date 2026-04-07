@@ -186,13 +186,16 @@ def compute_labels(s_fw, c_fw, b_fw, i_fw):
     accel = (w2 - w1) / (w1 + EPS)
     accel = float(np.clip(accel, -1, 10))
 
-    # C. signal_agreement — 비영 시그널 간 pairwise 상관계수 평균
-    sigs = [arr for arr in [s_fw, c_fw, b_fw, i_fw] if float(np.mean(arr)) > EPS]
+    # C. signal_agreement — 비영·비상수 시그널 간 pairwise 상관계수 평균
+    sigs = [arr for arr in [s_fw, c_fw, b_fw, i_fw]
+            if float(np.mean(arr)) > EPS and float(np.std(arr)) > EPS]
     if len(sigs) >= 2:
         corr_mat = np.corrcoef(sigs)
         n = len(sigs)
         pairs = [corr_mat[i, j] for i in range(n) for j in range(i + 1, n)]
         agreement = float(np.nanmean(pairs))
+        if np.isnan(agreement):
+            agreement = 0.0
     else:
         agreement = 0.0
 

@@ -376,8 +376,8 @@ if __name__ == "__main__":
         help="Optuna TPE 하이퍼파라미터 튜닝 활성화",
     )
     parser.add_argument(
-        "--n_trials", type=int, default=50,
-        help="Optuna trial 횟수 (기본값: 50)",
+        "--n_trials", type=int, default=25,
+        help="Optuna trial 횟수 (기본값: 25, early stopping 적용)",
     )
     parser.add_argument(
         "--gpu", action="store_true",
