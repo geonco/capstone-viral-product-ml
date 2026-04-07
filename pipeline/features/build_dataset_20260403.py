@@ -26,6 +26,7 @@ PATHS = {
 START = pd.Timestamp("2022-05-01")
 END = pd.Timestamp("2026-02-14")
 LB, FW = 60, 14
+SAMPLE_STRIDE = 7  # 기본 7일 간격 (겹침 50%), 14면 겹침 0%
 EPS = 1e-6
 CLIP = {"level": (0, 30), "growth": (-2, 20), "cv": (0, 10), "ratio": (0, 50)}
 
@@ -337,9 +338,9 @@ assert len(FEAT_COLS) == 216, f"expected 216, got {len(FEAT_COLS)}"
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def _process_keyword(args):
-    kw, s_arr, c_arr, plats, pred_idx, dates, s_inv = args
+    kw, s_arr, c_arr, plats, pred_idx, dates, s_inv, stride = args
     rows, skipped = [], 0
-    for ti in pred_idx:
+    for ti in pred_idx[::stride]:
         r = compute(s_arr, c_arr, plats, ti, s_inv)
         if r is None:
             skipped += 1
@@ -354,10 +355,16 @@ def _process_keyword(args):
 
 
 def main():
+    import argparse
     from multiprocessing import Pool, cpu_count
 
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--stride", type=int, default=SAMPLE_STRIDE, help="샘플링 간격 (기본 7일)")
+    args = parser.parse_args()
+    stride = args.stride
+
     print("=" * 50)
-    print("building dataset (216 features)")
+    print(f"building dataset (216 features, stride={stride})")
     print("=" * 50)
 
     search, click, mention = load_all()
@@ -370,11 +377,12 @@ def main():
     mention_kws = set(next(iter(mention.values())).index)
 
     n_workers = max(1, cpu_count() - 1)
+    est_samples = len(kws) * len(pred_idx[::stride])
     print(f"  {len(kws)} keywords, {len(dates)} days, {len(pred_idx)} pred dates")
+    print(f"  stride={stride} → ~{est_samples:,} samples (before filter)")
     print(f"  mention: {len(kws.intersection(mention_kws))}/{len(kws)}")
     print(f"  workers: {n_workers}")
 
-    # 키워드별 인자를 제너레이터로 생성 (메모리 선적재 방지)
     def gen_tasks():
         for kw in kws:
             sr = search.loc[kw, dates]
@@ -389,7 +397,7 @@ def main():
                 else:
                     plats[pfx] = np.zeros(len(dates), dtype=np.float64)
 
-            yield (kw, s, c, plats, pred_idx, dates, s_inv)
+            yield (kw, s, c, plats, pred_idx, dates, s_inv, stride)
 
     chunks, total, skipped = [], 0, 0
     with Pool(n_workers, maxtasksperchild=50) as pool:
