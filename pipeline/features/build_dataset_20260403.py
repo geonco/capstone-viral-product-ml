@@ -200,21 +200,7 @@ def compute_labels(s_fw, c_fw, b_fw, i_fw):
     else:
         agreement = 0.0
 
-    # D. trajectory_class — 미래 곡선 형태 (0~3)
-    # 0=spike_decay, 1=slow_build, 2=plateau, 3=volatile
-    peak_day = int(np.argmax(s_fw))
-    slope = float(np.polyfit(np.arange(FW), s_fw, 1)[0])
-    fw_cv = float(np.std(s_fw)) / (float(np.mean(s_fw)) + EPS)
-    if peak_day <= 4 and slope < 0:
-        traj = 0
-    elif slope > 0 and peak_day >= 10:
-        traj = 1
-    elif abs(slope) < float(np.mean(s_fw)) * 0.01 and fw_cv < 0.3:
-        traj = 2
-    else:
-        traj = 3
-
-    # E. search_click_convergence — 검색↔클릭 min-max 정규화 후 상관계수
+    # D. search_click_convergence — 검색↔클릭 min-max 정규화 후 상관계수
     s_range = float(np.max(s_fw) - np.min(s_fw))
     c_range = float(np.max(c_fw) - np.min(c_fw))
     if s_range > EPS and c_range > EPS:
@@ -230,7 +216,6 @@ def compute_labels(s_fw, c_fw, b_fw, i_fw):
         "future_intensity": round(intensity, 6),
         "future_acceleration": round(accel, 6),
         "signal_agreement": round(agreement, 6),
-        "trajectory_class": traj,
         "search_click_convergence": round(conv, 6),
     }
 
@@ -333,7 +318,7 @@ FEAT_COLS += ["day_of_week", "month"]
 
 LABEL_COLS = [
     "future_intensity", "future_acceleration",
-    "signal_agreement", "trajectory_class", "search_click_convergence",
+    "signal_agreement", "search_click_convergence",
 ]
 assert len(FEAT_COLS) == 216, f"expected 216, got {len(FEAT_COLS)}"
 

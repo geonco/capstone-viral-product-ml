@@ -34,12 +34,11 @@ TRAIN_RATIO = 0.70
 VALID_RATIO = 0.15
 GAP_DAYS = 74  # LB(60) + FW(14), train↔valid↔test 간 누수 방지
 
-CLASSIFICATION_TARGETS = {"trajectory_class"}
+CLASSIFICATION_TARGETS = set()
 TARGET_CONFIG = {
     "future_intensity":        {"log": True},
     "future_acceleration":     {"log": False},
     "signal_agreement":        {"log": False},
-    "trajectory_class":        {"log": False, "num_class": 4},
     "search_click_convergence":{"log": False},
 }
 
@@ -244,24 +243,26 @@ def shap_analysis(model: lgb.LGBMModel, X: pd.DataFrame, target: str, dirs: dict
 
     # multiclass: list of arrays → 클래스별 평균 절대값
     if isinstance(shap_values, list):
-        shap_values = np.mean([np.abs(sv) for sv in shap_values], axis=0)
+        shap_abs = np.mean([np.abs(sv) for sv in shap_values], axis=0)
+    else:
+        shap_abs = np.abs(shap_values)
 
     plt.figure()
-    shap.summary_plot(shap_values, X, plot_type="bar", show=False)
+    shap.summary_plot(shap_abs, X, plot_type="bar", show=False)
     plt.title(f"SHAP Importance (bar) — {target}")
     plt.tight_layout()
     plt.savefig(os.path.join(dirs["figures"], f"shap_bar_{target}.png"), dpi=150)
     plt.close()
 
     plt.figure()
-    shap.summary_plot(shap_values, X, show=False)
+    shap.summary_plot(shap_abs, X, show=False)
     plt.title(f"SHAP Beeswarm — {target}")
     plt.tight_layout()
     plt.savefig(os.path.join(dirs["figures"], f"shap_beeswarm_{target}.png"), dpi=150)
     plt.close()
 
     imp_df = (
-        pd.DataFrame({"feature": X.columns, "mean_abs_shap": np.abs(shap_values).mean(0)})
+        pd.DataFrame({"feature": X.columns, "mean_abs_shap": shap_abs.mean(0)})
         .sort_values("mean_abs_shap", ascending=False)
     )
     imp_df.to_csv(os.path.join(dirs["metrics"], f"shap_importance_{target}.csv"), index=False)
@@ -400,7 +401,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--target", type=str, default="future_intensity",
-        help="학습 타겟 (future_intensity, future_acceleration, signal_agreement, trajectory_class, search_click_convergence, all)",
+        help="학습 타겟 (future_intensity, future_acceleration, signal_agreement, search_click_convergence, all)",
     )
     parser.add_argument(
         "--tune", action="store_true",
@@ -421,7 +422,7 @@ if __name__ == "__main__":
 
     ALL_TARGETS = [
         "future_intensity", "future_acceleration",
-        "signal_agreement", "trajectory_class", "search_click_convergence",
+        "signal_agreement", "search_click_convergence",
     ]
     targets = ALL_TARGETS if args.target == "all" else [args.target]
     for t in targets:
