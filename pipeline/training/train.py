@@ -350,8 +350,8 @@ def main(csv_path: str, target: str, do_tune: bool, n_trials: int):
         y_train = np.log1p(train_df[target])
         y_valid = np.log1p(valid_df[target])
         y_test  = np.log1p(test_df[target])
-        w_train = 1.0 + np.log1p(train_df[target].values)
-        print(f"log1p 변환 적용, sample weight: min={w_train.min():.2f}  max={w_train.max():.2f}")
+        w_train = None
+        print("log1p 변환 적용")
     else:
         y_train = train_df[target]
         y_valid = valid_df[target]
