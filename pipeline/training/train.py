@@ -1,6 +1,6 @@
 # LightGBM 바이럴 예측 모델 (Optuna TPE 하이퍼파라미터 튜닝 포함)
-# - virality_score : z-score 기반 바이럴 강도 (60일 lookback, 14일 forward)
-# - peak_time      : argmax(search[t:t+14]), 0~13
+# 6개 타겟: future_intensity, future_acceleration, peak_timing,
+#           signal_agreement, trajectory_class, search_click_convergence
 
 import argparse
 import json
@@ -14,7 +14,10 @@ import numpy as np
 import optuna
 import pandas as pd
 import shap
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.metrics import (
+    mean_absolute_error, mean_squared_error,
+    accuracy_score, f1_score, confusion_matrix,
+)
 from sklearn.model_selection import train_test_split
 
 sys.path.append(os.path.dirname(__file__))
@@ -25,11 +28,20 @@ warnings.filterwarnings("ignore")
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 # ── 상수 ──────────────────────────────────────────────────────────────────────
-TARGET_VIRALITY = "virality_score"
-DATE_COL        = "date"
+DATE_COL = "date"
 
 TRAIN_RATIO = 0.70
 VALID_RATIO = 0.15
+
+CLASSIFICATION_TARGETS = {"trajectory_class"}
+TARGET_CONFIG = {
+    "future_intensity":        {"log": True},
+    "future_acceleration":     {"log": False},
+    "peak_timing":             {"log": False},
+    "signal_agreement":        {"log": False},
+    "trajectory_class":        {"log": False, "num_class": 4},
+    "search_click_convergence":{"log": False},
+}
 
 DEFAULT_PARAMS = {
     "boosting_type"    : "gbdt",
@@ -61,10 +73,10 @@ SEARCH_SPACE = {
 
 _ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
 
-def _make_run_dir():
+def _make_run_dir(target: str = ""):
     from datetime import datetime
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run = os.path.join(_ROOT, "outputs", f"run_{stamp}")
+    run = os.path.join(_ROOT, "outputs", f"run_{stamp}_{target}" if target else f"run_{stamp}")
     dirs = {
         "figures": os.path.join(run, "figures"),
         "metrics": os.path.join(run, "metrics"),
@@ -85,6 +97,13 @@ def evaluate(y_true, y_pred, split: str, target: str) -> dict:
     mae  = float(mean_absolute_error(y_true, y_pred))
     print(f"  [{split:5s}] {target}  RMSE={rmse:.4f}  MAE={mae:.4f}")
     return {"split": split, "target": target, "rmse": rmse, "mae": mae}
+
+
+def evaluate_clf(y_true, y_pred, split: str, target: str) -> dict:
+    acc = float(accuracy_score(y_true, y_pred))
+    f1  = float(f1_score(y_true, y_pred, average="macro"))
+    print(f"  [{split:5s}] {target}  Acc={acc:.4f}  F1(macro)={f1:.4f}")
+    return {"split": split, "target": target, "accuracy": acc, "f1_macro": f1}
 
 
 # ── 데이터 분할 ───────────────────────────────────────────────────────────────
@@ -116,6 +135,8 @@ def tune_params(
 ) -> dict:
     print(f"\nOptuna TPE 튜닝 시작: {target}  (trials={n_trials})")
 
+    is_clf = target in CLASSIFICATION_TARGETS
+
     def objective(trial: optuna.Trial) -> float:
         params = {**fixed_params}
         for name, spec in SEARCH_SPACE.items():
@@ -126,8 +147,9 @@ def tune_params(
                 params[name] = trial.suggest_int(name, spec[1], spec[2])
 
         params["n_estimators"] = 3000
+        ModelClass = lgb.LGBMClassifier if is_clf else lgb.LGBMRegressor
 
-        model = lgb.LGBMRegressor(**params)
+        model = ModelClass(**params)
         model.fit(
             X_train, y_train,
             sample_weight=w_train,
@@ -137,6 +159,8 @@ def tune_params(
                 lgb.log_evaluation(period=-1),
             ],
         )
+        if is_clf:
+            return -float(accuracy_score(y_valid, model.predict(X_valid)))
         return rmse_score(y_valid, model.predict(X_valid))
 
     study = optuna.create_study(
@@ -146,10 +170,12 @@ def tune_params(
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
 
     best = study.best_params
-    print(f"  best valid RMSE: {study.best_value:.4f}")
+    metric_name = "Acc" if is_clf else "RMSE"
+    metric_val = -study.best_value if is_clf else study.best_value
+    print(f"  best valid {metric_name}: {metric_val:.4f}")
     print(f"  best params: {best}")
 
-    out = {"target": target, "best_rmse": study.best_value, "best_params": best}
+    out = {"target": target, f"best_{metric_name.lower()}": metric_val, "best_params": best}
     path = os.path.join(dirs["metrics"], f"best_params_{target}.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2, ensure_ascii=False)
@@ -164,9 +190,10 @@ def train_lgbm(
     target: str,
     params: dict,
     w_train=None,
-) -> lgb.LGBMRegressor:
+) -> lgb.LGBMModel:
 
-    model = lgb.LGBMRegressor(**params)
+    ModelClass = lgb.LGBMClassifier if target in CLASSIFICATION_TARGETS else lgb.LGBMRegressor
+    model = ModelClass(**params)
     model.fit(
         X_train, y_train,
         sample_weight=w_train,
@@ -181,9 +208,13 @@ def train_lgbm(
 
 
 # ── SHAP 분석 ─────────────────────────────────────────────────────────────────
-def shap_analysis(model: lgb.LGBMRegressor, X: pd.DataFrame, target: str, dirs: dict):
+def shap_analysis(model: lgb.LGBMModel, X: pd.DataFrame, target: str, dirs: dict):
     explainer   = shap.TreeExplainer(model)
     shap_values = explainer.shap_values(X)
+
+    # multiclass: list of arrays → 클래스별 평균 절대값
+    if isinstance(shap_values, list):
+        shap_values = np.mean([np.abs(sv) for sv in shap_values], axis=0)
 
     plt.figure()
     shap.summary_plot(shap_values, X, plot_type="bar", show=False)
@@ -233,13 +264,20 @@ def run_model(
 
     model = train_lgbm(X_train, y_train, X_valid, y_valid, target, params, w_train)
 
+    is_clf = target in CLASSIFICATION_TARGETS
+    eval_fn = evaluate_clf if is_clf else evaluate
+
     results = []
     for split, X, y in [
         ("train", X_train, y_train),
         ("valid", X_valid, y_valid),
         ("test",  X_test,  y_test),
     ]:
-        results.append(evaluate(y, model.predict(X), split, target))
+        results.append(eval_fn(y, model.predict(X), split, target))
+
+    if is_clf:
+        cm = confusion_matrix(y_test, model.predict(X_test))
+        np.savetxt(os.path.join(dirs["metrics"], f"confusion_{target}.csv"), cm, delimiter=",", fmt="%d")
 
     shap_analysis(model, X_test, target, dirs)
     model.booster_.save_model(os.path.join(dirs["models"], f"lgbm_{target}.txt"))
@@ -249,7 +287,7 @@ def run_model(
 
 # ── 메인 ──────────────────────────────────────────────────────────────────────
 def main(csv_path: str, target: str, do_tune: bool, n_trials: int):
-    dirs = _make_run_dir()
+    dirs = _make_run_dir(target)
     print(f"output → {os.path.dirname(dirs['figures'])}")
     print(f"target: {target}")
 
@@ -265,8 +303,20 @@ def main(csv_path: str, target: str, do_tune: bool, n_trials: int):
     X_test  = test_df[FEAT_COLS]
 
     # 타겟별 전처리
-    use_log = target in ("virality_score", "click_weighted_lift", "future_ratio")
-    if use_log:
+    cfg = TARGET_CONFIG.get(target, {"log": False})
+    is_clf = target in CLASSIFICATION_TARGETS
+    use_log = cfg.get("log", False)
+
+    base_params = {**DEFAULT_PARAMS}
+    if is_clf:
+        base_params["objective"] = "multiclass"
+        base_params["num_class"] = cfg.get("num_class", 4)
+        base_params["metric"] = "multi_logloss"
+        y_train = train_df[target].astype(int)
+        y_valid = valid_df[target].astype(int)
+        y_test  = test_df[target].astype(int)
+        w_train = None
+    elif use_log:
         y_train = np.log1p(train_df[target])
         y_valid = np.log1p(valid_df[target])
         y_test  = np.log1p(test_df[target])
@@ -283,7 +333,7 @@ def main(csv_path: str, target: str, do_tune: bool, n_trials: int):
         X_valid, y_valid,
         X_test,  y_test,
         target     = target,
-        base_params= {**DEFAULT_PARAMS},
+        base_params= base_params,
         do_tune    = do_tune,
         n_trials   = n_trials,
         dirs       = dirs,
@@ -291,7 +341,7 @@ def main(csv_path: str, target: str, do_tune: bool, n_trials: int):
     )
 
     # log 변환 사용 시 원래 스케일 복원 평가
-    if use_log:
+    if use_log and not is_clf:
         model_path = os.path.join(dirs["models"], f"lgbm_{target}.txt")
         if os.path.exists(model_path):
             _model = lgb.Booster(model_file=model_path)
@@ -319,8 +369,8 @@ if __name__ == "__main__":
         help="216피처 + 라벨 CSV 경로",
     )
     parser.add_argument(
-        "--target", type=str, default="virality_score",
-        help="학습 타겟 (virality_score, viral_percentile, concordance, sustained_breakout, trajectory_class, click_weighted_lift)",
+        "--target", type=str, default="future_intensity",
+        help="학습 타겟 (future_intensity, future_acceleration, peak_timing, signal_agreement, trajectory_class, search_click_convergence, all)",
     )
     parser.add_argument(
         "--tune", action="store_true",
@@ -340,8 +390,8 @@ if __name__ == "__main__":
         print("GPU mode enabled")
 
     ALL_TARGETS = [
-        "virality_score", "viral_percentile", "concordance",
-        "sustained_breakout", "trajectory_class", "click_weighted_lift",
+        "future_intensity", "future_acceleration", "peak_timing",
+        "signal_agreement", "trajectory_class", "search_click_convergence",
     ]
     targets = ALL_TARGETS if args.target == "all" else [args.target]
     for t in targets:

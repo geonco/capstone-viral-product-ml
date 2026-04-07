@@ -27,8 +27,6 @@ START = pd.Timestamp("2022-05-01")
 END = pd.Timestamp("2026-02-14")
 LB, FW = 60, 14
 EPS = 1e-6
-MIN_ABS_CHANGE = 10
-
 CLIP = {"level": (0, 30), "growth": (-2, 20), "cv": (0, 10), "ratio": (0, 50)}
 
 W_FULL = [3, 5, 7, 14, 30]          # scale, level, growth, spikiness, lag
@@ -178,29 +176,30 @@ def cross_feat(sf, cf, pfs):
 
 # ── labels ────────────────────────────────────────────────────────────────────
 
-def compute_labels(s_lb, s_fw, c_lb, c_fw, plat_lbs, plat_fws):
-    mu = float(np.mean(s_lb))
-    sigma = float(np.std(s_lb))
-    fmax = float(np.max(s_fw))
-    delta = fmax - mu
+def compute_labels(s_fw, c_fw, b_fw, i_fw):
+    # A. future_intensity — 4채널 합산 버즈 볼륨
+    intensity = float(np.mean(s_fw) + np.mean(c_fw) + np.mean(b_fw) + np.mean(i_fw))
 
-    # A. 기존 virality_score (z-score)
-    z = 0.0 if delta < MIN_ABS_CHANGE else delta / (sigma + EPS)
+    # B. future_acceleration — 검색 week2/week1 성장률
+    w1 = float(np.mean(s_fw[:7]))
+    w2 = float(np.mean(s_fw[7:]))
+    accel = (w2 - w1) / (w1 + EPS)
+    accel = float(np.clip(accel, -1, 10))
 
-    # B. concordance — 멀티시그널 동시 급등 (0~4)
-    concordance = 0
-    for lb, fw in [(s_lb, s_fw), (c_lb, c_fw)] + list(zip(plat_lbs, plat_fws)):
-        p75 = float(np.percentile(lb, 75))
-        if float(np.max(fw)) > p75 and p75 > 0:
-            concordance += 1
+    # C. peak_timing — 검색 피크 시점 (0=즉시, 1=후반)
+    timing = int(np.argmax(s_fw)) / 13.0
 
-    # C. sustained_breakout — 1주차 역대최고 + 2주차 유지 (0/1)
-    week1 = float(np.mean(s_fw[:7]))
-    week2 = float(np.mean(s_fw[7:]))
-    hist_max = float(np.max(s_lb))
-    sustained = int(week1 > hist_max and week2 > week1)
+    # D. signal_agreement — 비영 시그널 간 pairwise 상관계수 평균
+    sigs = [arr for arr in [s_fw, c_fw, b_fw, i_fw] if float(np.mean(arr)) > EPS]
+    if len(sigs) >= 2:
+        corr_mat = np.corrcoef(sigs)
+        n = len(sigs)
+        pairs = [corr_mat[i, j] for i in range(n) for j in range(i + 1, n)]
+        agreement = float(np.nanmean(pairs))
+    else:
+        agreement = 0.0
 
-    # D. trajectory_class — 미래 곡선 형태 (0~3)
+    # E. trajectory_class — 미래 곡선 형태 (0~3)
     # 0=spike_decay, 1=slow_build, 2=plateau, 3=volatile
     peak_day = int(np.argmax(s_fw))
     slope = float(np.polyfit(np.arange(FW), s_fw, 1)[0])
@@ -214,21 +213,25 @@ def compute_labels(s_lb, s_fw, c_lb, c_fw, plat_lbs, plat_fws):
     else:
         traj = 3
 
-    # E. click_weighted_lift — 클릭 가중 검색 상승
-    c_fw_mean = float(np.mean(c_fw))
-    c_weight = c_fw / (c_fw_mean + EPS) if c_fw_mean > 0 else np.ones_like(c_fw)
-    s_lb_mean = float(np.mean(s_lb))
-    c_lb_mean = float(np.mean(c_lb))
-    lift = float(np.mean(s_fw * c_weight)) / (s_lb_mean * c_lb_mean + EPS) if s_lb_mean > 0 and c_lb_mean > 0 else 0.0
+    # F. search_click_convergence — 검색↔클릭 min-max 정규화 후 상관계수
+    s_range = float(np.max(s_fw) - np.min(s_fw))
+    c_range = float(np.max(c_fw) - np.min(c_fw))
+    if s_range > EPS and c_range > EPS:
+        s_norm = (s_fw - np.min(s_fw)) / (s_range + EPS)
+        c_norm = (c_fw - np.min(c_fw)) / (c_range + EPS)
+        conv = float(np.corrcoef(s_norm, c_norm)[0, 1])
+        if np.isnan(conv):
+            conv = 0.0
+    else:
+        conv = 0.0
 
     return {
-        "virality_score": round(z, 6),
-        "concordance": concordance,
-        "sustained_breakout": sustained,
+        "future_intensity": round(intensity, 6),
+        "future_acceleration": round(accel, 6),
+        "peak_timing": round(timing, 6),
+        "signal_agreement": round(agreement, 6),
         "trajectory_class": traj,
-        "click_weighted_lift": round(lift, 6),
-        # viral_percentile은 main()에서 후처리
-        "future_ratio": round(fmax / (mu + EPS), 6),
+        "search_click_convergence": round(conv, 6),
     }
 
 
@@ -285,10 +288,10 @@ def compute(s, c, plats, t, s_inv):
     row["day_of_week"] = t  # placeholder
     row["month"] = t        # placeholder
 
-    # 라벨 — 모든 시그널의 forward 데이터 전달
-    plat_lbs = [plats[p][lo:t] for p in ["blog", "instagram"] if p in plats]
-    plat_fws = [plats[p][t:hi] for p in ["blog", "instagram"] if p in plats]
-    row.update(compute_labels(s_lb, s_fw, c_lb, c_fw, plat_lbs, plat_fws))
+    # 라벨 — 미래 14일 데이터만 사용
+    b_fw = plats["blog"][t:hi] if "blog" in plats else np.zeros(FW, dtype=np.float64)
+    i_fw = plats["instagram"][t:hi] if "instagram" in plats else np.zeros(FW, dtype=np.float64)
+    row.update(compute_labels(s_fw, c_fw, b_fw, i_fw))
     return row
 
 
@@ -329,8 +332,8 @@ FEAT_COLS += [
 FEAT_COLS += ["day_of_week", "month"]
 
 LABEL_COLS = [
-    "virality_score", "concordance", "sustained_breakout",
-    "trajectory_class", "click_weighted_lift", "future_ratio",
+    "future_intensity", "future_acceleration", "peak_timing",
+    "signal_agreement", "trajectory_class", "search_click_convergence",
 ]
 assert len(FEAT_COLS) == 216, f"expected 216, got {len(FEAT_COLS)}"
 
@@ -406,10 +409,7 @@ def main():
     df = pd.concat(chunks, ignore_index=True)
     del chunks
 
-    # viral_percentile — 같은 날짜 키워드 간 상대 순위
-    df["viral_percentile"] = df.groupby("date")["future_ratio"].rank(pct=True) * 100
-    df["viral_percentile"] = df["viral_percentile"].round(2)
-    ALL_LABELS = LABEL_COLS + ["viral_percentile"]
+    ALL_LABELS = LABEL_COLS
 
     df = df[["keyword", "date"] + FEAT_COLS + ALL_LABELS]
     df.sort_values(["keyword", "date"], inplace=True)

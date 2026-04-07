@@ -41,9 +41,8 @@ FEAT_COLS += [
 FEAT_COLS += ["day_of_week", "month"]
 
 LABEL_COLS = [
-    "virality_score", "concordance", "sustained_breakout",
-    "trajectory_class", "click_weighted_lift", "future_ratio",
-    "viral_percentile",
+    "future_intensity", "future_acceleration", "peak_timing",
+    "signal_agreement", "trajectory_class", "search_click_convergence",
 ]
 META_COLS = ["keyword", "date"]
 ALL_COLS = META_COLS + FEAT_COLS + LABEL_COLS
