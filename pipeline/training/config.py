@@ -1,5 +1,5 @@
-# 310피처 데이터셋 컬럼 정의
-# build_dataset.py의 FEAT_COLS 생성 로직과 동일
+# 348피처 + 15라벨 데이터셋 컬럼 정의
+# build_dataset.py의 FEAT_COLS/LABEL_COLS 생성 로직과 동일
 
 SIGNALS = ["search", "click", "blog", "instagram"]
 W_FULL = [3, 5, 7, 14, 30]
@@ -31,12 +31,16 @@ def _sig_cols(p):
     # M. Wave Dynamics (6)
     c += [f"{p}_vol_ratio", f"{p}_range_squeeze", f"{p}_damping"]
     c += [f"{p}_zero_crossings_14d", f"{p}_direction_streak", f"{p}_reversal_3d"]
-    # N. Regime/Breakout (4)
+    # N. Regime/Breakout (5)
     c += [f"{p}_band_position", f"{p}_band_width", f"{p}_drawdown_14d", f"{p}_breakout_strength"]
+    c.append(f"{p}_band_approach")
     # O. Daily Momentum (4)
     c += [f"{p}_daily_return_1d", f"{p}_daily_returns_3d_avg"]
     c += [f"{p}_momentum_divergence", f"{p}_daily_accel_1d"]
-    return c
+    # P. Daily Change (7)
+    for d in range(1, 8):
+        c.append(f"{p}_change_{d}d_ago")
+    return c  # 73개
 
 
 FEAT_COLS = []
@@ -55,6 +59,8 @@ FEAT_COLS += [
     "blog_search_dir_agree", "insta_search_dir_agree", "click_search_dir_agree",
     "blog_search_slope_gap", "insta_search_slope_gap",
     "multi_slope_count",
+    "blog_search_lead_magnitude", "insta_search_lead_magnitude", "click_search_lead_magnitude",
+    "weighted_slope_strength", "activation_spread",
 ]
 FEAT_COLS += [
     "blog_surge_intensity_3d", "blog_surge_intensity_7d",
@@ -68,18 +74,20 @@ for _n in _W_MULTI:
     if _n >= 3:
         FEAT_COLS.append(f"multi_accel_{_n}d")
     FEAT_COLS.append(f"past_buzz_zscore_{_n}d")
+FEAT_COLS += ["conv_trend"]
 FEAT_COLS += ["month"]
 
 LABEL_COLS = [
-    "future_intensity", "future_acceleration", "peak_timing",
-    "signal_agreement", "search_click_convergence",
-    "buzz_composite", "momentum_score",
+    "intensity_5d", "intensity_10d", "intensity_15d",
+    "buzz_composite_5d", "buzz_composite_10d", "buzz_composite_15d",
+    "growth_5d", "growth_10d", "growth_15d",
+    "sustainability_5d", "sustainability_10d", "sustainability_15d",
+    "crash_5d", "crash_10d", "crash_15d",
 ]
 META_COLS = ["keyword", "date"]
 ALL_COLS = META_COLS + FEAT_COLS + LABEL_COLS
 
-# data_loader 검증 시 피처만 필수, 라벨은 --target에 따라 하나만 사용
 REQUIRED_COLS = FEAT_COLS
 OPTIONAL_COLS = META_COLS + LABEL_COLS
 
-assert len(FEAT_COLS) == 310, f"expected 310, got {len(FEAT_COLS)}"
+assert len(FEAT_COLS) == 348, f"expected 348, got {len(FEAT_COLS)}"

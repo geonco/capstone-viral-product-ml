@@ -1,7 +1,5 @@
 # LightGBM 바이럴 예측 모델 (Optuna TPE 하이퍼파라미터 튜닝 포함)
-# 7개 타겟: future_intensity, future_acceleration, peak_timing,
-#           signal_agreement, search_click_convergence,
-#           buzz_composite, momentum_score
+# 15개 타겟 (5종 × 3윈도우): intensity, buzz_composite, growth, sustainability, crash
 
 import argparse
 import json
@@ -30,16 +28,24 @@ DATE_COL = "date"
 
 TRAIN_RATIO = 0.70
 VALID_RATIO = 0.15
-GAP_DAYS = 74  # LB(60) + FW(14), train↔valid↔test 간 누수 방지
+GAP_DAYS = 75  # LB(60) + FW(15), train↔valid↔test 간 누수 방지
 
 TARGET_CONFIG = {
-    "future_intensity":        {"log": True},
-    "future_acceleration":     {"log": False},
-    "peak_timing":             {"log": False},
-    "signal_agreement":        {"log": False},
-    "search_click_convergence":{"log": False},
-    "buzz_composite":     {"log": False},
-    "momentum_score":     {"log": False},
+    "intensity_5d":            {"log": True},
+    "intensity_10d":           {"log": True},
+    "intensity_15d":           {"log": True},
+    "buzz_composite_5d":       {"log": False},
+    "buzz_composite_10d":      {"log": False},
+    "buzz_composite_15d":      {"log": False},
+    "growth_5d":               {"log": False},
+    "growth_10d":              {"log": False},
+    "growth_15d":              {"log": False},
+    "sustainability_5d":       {"log": False},
+    "sustainability_10d":      {"log": False},
+    "sustainability_15d":      {"log": False},
+    "crash_5d":                {"log": False},
+    "crash_10d":               {"log": False},
+    "crash_15d":               {"log": False},
 }
 
 DEFAULT_PARAMS = {
@@ -381,12 +387,12 @@ def main(csv_path: str, target: str, do_tune: bool, n_trials: int, train_stride:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--data", type=str, default=None,
-        help="310피처 + 라벨 CSV 경로 (미지정 시 data/processed/ 내 최신 파일)",
+        "--data", type=str, default=os.path.join(_ROOT, "data", "processed", "dataset.csv"),
+        help="피처 + 라벨 CSV 경로",
     )
     parser.add_argument(
-        "--target", type=str, default="future_intensity",
-        help="학습 타겟 (future_intensity, future_acceleration, peak_timing, signal_agreement, search_click_convergence, buzz_composite, momentum_score, all)",
+        "--target", type=str, default="sustainability_10d",
+        help="학습 타겟 (intensity/buzz_composite/growth/sustainability/crash + _5d/_10d/_15d, 또는 all)",
     )
     parser.add_argument(
         "--tune", action="store_true",
@@ -409,21 +415,13 @@ if __name__ == "__main__":
         DEFAULT_PARAMS["device"] = "cuda"
         print("GPU mode enabled")
 
-    # --data 미지정 시 최신 dataset 자동 선택
-    csv_path = args.data
-    if csv_path is None:
-        import glob
-        candidates = sorted(glob.glob(os.path.join(_ROOT, "data", "processed", "dataset_*.csv")))
-        if not candidates:
-            parser.error("data/processed/에 dataset_*.csv 파일 없음. --data로 경로 지정 필요")
-        csv_path = candidates[-1]
-        print(f"auto-selected: {csv_path}")
-
     ALL_TARGETS = [
-        "future_intensity", "future_acceleration", "peak_timing",
-        "signal_agreement", "search_click_convergence",
-        "buzz_composite", "momentum_score",
+        "intensity_5d", "intensity_10d", "intensity_15d",
+        "buzz_composite_5d", "buzz_composite_10d", "buzz_composite_15d",
+        "growth_5d", "growth_10d", "growth_15d",
+        "sustainability_5d", "sustainability_10d", "sustainability_15d",
+        "crash_5d", "crash_10d", "crash_15d",
     ]
     targets = ALL_TARGETS if args.target == "all" else [args.target]
     for t in targets:
-        main(csv_path, t, args.tune, args.n_trials, args.train_stride)
+        main(args.data, t, args.tune, args.n_trials, args.train_stride)

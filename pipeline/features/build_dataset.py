@@ -7,10 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 RAW = ROOT / "data" / "raw"
-def _out_path():
-    from datetime import datetime
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return ROOT / "data" / "processed" / f"dataset_{stamp}.csv"
+OUT_PATH = ROOT / "data" / "processed" / "dataset.csv"
 
 PATHS = {
     "search": RAW / "search" / "absolute.csv",
@@ -20,7 +17,7 @@ PATHS = {
 
 START = pd.Timestamp("2022-05-01")
 END = pd.Timestamp("2026-02-14")
-LB, FW = 60, 14
+LB, FW = 60, 15
 SAMPLE_STRIDE = 1  # 빌드 시 stride=1 (전체), train/valid 서브샘플링은 train.py에서
 EPS = 1e-6
 CLIP = {"level": (0, 30), "growth": (-2, 20), "cv": (0, 10), "ratio": (0, 50)}
@@ -111,7 +108,7 @@ def _rsi(arr, period=14):
     return 100.0 - 100.0 / (1.0 + rs)
 
 
-# ── signal features (65 per signal) ──────────────────────────────────────────
+# ── signal features (73 per signal) ──────────────────────────────────────────
 
 def sig_feat(lb, p):
     # lb: 60-day lookback, p: prefix
@@ -236,7 +233,7 @@ def sig_feat(lb, p):
     d3 = np.diff(lb[-4:])
     f[f"{p}_reversal_3d"] = int(d3[-1] * d3[-2] < 0) if len(d3) >= 2 else 0
 
-    # N. Regime/Breakout — 볼린저 밴드, 돌파 강도 (4)
+    # N. Regime/Breakout — 볼린저 밴드, 돌파 강도 (5)
     mu_30 = float(np.mean(lb[-30:]))
     upper = mu_30 + 2 * std_30
     lower = mu_30 - 2 * std_30
@@ -245,6 +242,8 @@ def sig_feat(lb, p):
     f[f"{p}_band_width"] = band_range / (mu_30 + EPS)
     f[f"{p}_drawdown_14d"] = (float(lb[-1]) - float(np.max(lb[-14:]))) / (float(np.max(lb[-14:])) + EPS)
     f[f"{p}_breakout_strength"] = (float(lb[-1]) - upper) / (std_30 + EPS)
+    bp_3d_ago = (float(lb[-4]) - lower) / (band_range + EPS)
+    f[f"{p}_band_approach"] = f[f"{p}_band_position"] - bp_3d_ago
 
     # O. Daily Momentum — 일별 변화율, 다이버전스 (4)
     prev_val = float(lb[-2])
@@ -259,6 +258,11 @@ def sig_feat(lb, p):
 
     daily_accel_arr = np.diff(lb[-3:])
     f[f"{p}_daily_accel_1d"] = float(daily_accel_arr[-1] - daily_accel_arr[0]) if len(daily_accel_arr) >= 2 else 0.0
+
+    # P. Daily Change — 최근 7일 개별 변화율 (7)
+    for d in range(1, 8):
+        change = (float(lb[-d]) - float(lb[-(d + 1)])) / (abs(float(lb[-(d + 1)])) + EPS)
+        f[f"{p}_change_{d}d_ago"] = float(np.clip(change, -10, 100))
 
     return f
 
@@ -308,7 +312,7 @@ def cross_feat(sf, cf, pfs, all_lbs):
         f[f"{pp}_lead_7d"] = pf[f"{pp}_growth_7d"] - sf["search_growth_7d"]
         f[f"{pp}_search_ratio"] = _clip(pf[f"{pp}_level_7d"] / (s7 + EPS), "ratio")
 
-    # 신규 12개 — 교차상관 시차, 방향 동조, 기울기 괴리
+    # 신규 — 교차상관 시차, 방향 동조, 기울기 괴리, 시차 크기 괴리
     s_lb = all_lbs["search"]
     for other in ["blog", "instagram", "click"]:
         prefix = "insta" if other == "instagram" else other
@@ -317,6 +321,14 @@ def cross_feat(sf, cf, pfs, all_lbs):
         f[f"{prefix}_search_best_lag"] = lag
         f[f"{prefix}_search_peak_xcorr"] = xcorr
         f[f"{prefix}_search_dir_agree"] = _dir_agree(o_lb, s_lb)
+
+        # lead_magnitude — best_lag 시점에서 other가 search 대비 얼마나 앞서 있었나
+        if lag > 0 and len(o_lb) > lag + 3:
+            o_level = float(np.mean(o_lb[-(lag + 3):-lag])) / (float(np.mean(o_lb)) + EPS)
+            s_level = float(np.mean(s_lb[-(lag + 3):-lag])) / (float(np.mean(s_lb)) + EPS)
+            f[f"{prefix}_search_lead_magnitude"] = o_level / (s_level + EPS)
+        else:
+            f[f"{prefix}_search_lead_magnitude"] = 1.0
 
     # 기울기 괴리 (blog/insta → search 선행 여부)
     f["blog_search_slope_gap"] = pfs.get("blog", {}).get("blog_norm_slope_7d", 0.0) - sf["search_norm_slope_7d"]
@@ -329,8 +341,32 @@ def cross_feat(sf, cf, pfs, all_lbs):
         and float(np.polyfit(np.arange(7), all_lbs[sig][-7:], 1)[0]) > 0
     )
 
-    # ── 멀티채널 종합 피처 (3종×5윈도우 + accel×4윈도우(n≥3) = 19개) ──
+    # weighted_slope_strength — 기울기 크기까지 반영한 가중 모멘텀 강도
     weights = {"search": 0.4, "click": 0.3, "blog": 0.2, "instagram": 0.1}
+    wss = 0.0
+    for sig, w in weights.items():
+        lb = all_lbs.get(sig, np.zeros(1))
+        if len(lb) >= 7:
+            ns = float(np.polyfit(np.arange(7), lb[-7:], 1)[0]) / (float(np.mean(lb)) + EPS)
+            wss += w * ns
+    f["weighted_slope_strength"] = wss
+
+    # activation_spread — 채널 활성화 시차 (동시=0, 순차적=큰 값)
+    first_days = []
+    for sig in ["search", "click", "blog", "instagram"]:
+        lb = all_lbs.get(sig, np.zeros(1))
+        if len(lb) >= 14:
+            med = float(np.median(lb))
+            if med > EPS:
+                above = np.where(lb[-14:] > med)[0]
+                first_days.append(int(above[0]) if len(above) > 0 else 14)
+            else:
+                first_days.append(14)
+        else:
+            first_days.append(14)
+    f["activation_spread"] = max(first_days) - min(first_days)
+
+    # ── 멀티채널 종합 피처 (3종×5윈도우 + accel×4윈도우(n≥3) + conv_trend = 20개) ──
     W_MULTI = [1, 3, 7, 14, 30]
 
     for n in W_MULTI:
@@ -372,88 +408,55 @@ def cross_feat(sf, cf, pfs, all_lbs):
                 zscore_sum += w * z
         f[f"past_buzz_zscore_{n}d"] = zscore_sum
 
+    # conv_trend — 전환율 추세 (최근 3일 vs 14일)
+    f["conv_trend"] = f["past_conversion_rate_3d"] - f["past_conversion_rate_14d"]
+
     return f
 
 
 # ── labels ────────────────────────────────────────────────────────────────────
 
 def compute_labels(s_fw, c_fw, b_fw, i_fw, s_lb, c_lb, b_lb, i_lb, kw_stats=None):
-    # A. buzz_composite — 4채널 z-score 가중 합산
+    # 5종 × 3윈도우 = 15 라벨
     sigs_fw = {"search": s_fw, "click": c_fw, "blog": b_fw, "instagram": i_fw}
     sigs_lb = {"search": s_lb, "click": c_lb, "blog": b_lb, "instagram": i_lb}
     weights = {"search": 0.4, "click": 0.3, "blog": 0.2, "instagram": 0.1}
+    combined = s_fw + c_fw + b_fw + i_fw
 
-    composite = 0.0
-    for sig, w in weights.items():
-        mu = float(np.mean(sigs_lb[sig]))
-        sigma = float(np.std(sigs_lb[sig]))
-        fw_mean = float(np.mean(sigs_fw[sig]))
-        z = (fw_mean - mu) / (sigma + EPS) if sigma > EPS else 0.0
-        composite += w * z
+    labels = {}
+    for w in [5, 10, 15]:
+        fw_w = combined[:w]
 
-    # B. momentum_score — 4채널 가중 가속도 (-1~1)
-    accel_sum, w_sum = 0.0, 0.0
-    for sig, w in weights.items():
-        w1 = float(np.mean(sigs_fw[sig][:7]))
-        w2 = float(np.mean(sigs_fw[sig][7:]))
-        denom = max(w1, w2)
-        if denom > EPS:
-            accel = (w2 - w1) / (denom + EPS)
-            accel_sum += w * accel
-            w_sum += w
-    momentum = accel_sum / (w_sum + EPS) if w_sum > 0 else 0.0
-    momentum = float(np.clip(momentum, -1, 1))
+        # intensity — 4채널 합산 평균
+        labels[f"intensity_{w}d"] = round(float(np.mean(fw_w)), 6)
 
-    # ── 순수 미래 라벨 ──
+        # buzz_composite — 4채널 z-score 가중합 (lookback 기준)
+        comp = 0.0
+        for sig, wt in weights.items():
+            mu = float(np.mean(sigs_lb[sig]))
+            sigma = float(np.std(sigs_lb[sig]))
+            fw_mean = float(np.mean(sigs_fw[sig][:w]))
+            z = (fw_mean - mu) / (sigma + EPS) if sigma > EPS else 0.0
+            comp += wt * z
+        labels[f"buzz_composite_{w}d"] = round(comp, 6)
 
-    # future_intensity — 4채널 합산 버즈 볼륨
-    intensity = float(np.mean(s_fw) + np.mean(c_fw) + np.mean(b_fw) + np.mean(i_fw))
+        # growth — 과거 대비 4채널 가중 성장률
+        gr = 0.0
+        for sig, wt in weights.items():
+            past = float(np.mean(sigs_lb[sig][-w:]))
+            future = float(np.mean(sigs_fw[sig][:w]))
+            gr += wt * ((future - past) / (past + EPS))
+        labels[f"growth_{w}d"] = round(float(np.clip(gr, -5, 50)), 6)
 
-    # peak_timing — 4채널 합산 피크 시점 (0=즉시, 1=후반)
-    peak_timing = int(np.argmax(s_fw + c_fw + b_fw + i_fw)) / (FW - 1)
+        # sustainability — 현재 대비 미래 평균 유지율 (>1 성장, <1 하락)
+        current = float(fw_w[0])
+        labels[f"sustainability_{w}d"] = round(float(np.mean(fw_w)) / (current + EPS), 6)
 
-    # future_acceleration — 검색 week2/week1 성장률
-    fa_w1 = float(np.mean(s_fw[:7]))
-    fa_w2 = float(np.mean(s_fw[7:]))
-    fa_accel = (fa_w2 - fa_w1) / (fa_w1 + EPS)
-    fa_accel = float(np.clip(fa_accel, -1, 10))
+        # crash — 현재에서 최저점까지 하락률 (0=안빠짐, 양수=빠짐)
+        cr = (current - float(np.min(fw_w))) / (current + EPS) if current > EPS else 0.0
+        labels[f"crash_{w}d"] = round(float(np.clip(cr, 0, 10)), 6)
 
-    # signal_agreement — 비영·비상수 시그널 간 pairwise 상관계수 평균
-    sigs_list = [arr for arr in [s_fw, c_fw, b_fw, i_fw]
-                 if float(np.mean(arr)) > EPS and float(np.std(arr)) > EPS]
-    if len(sigs_list) >= 2:
-        corr_mat = np.corrcoef(sigs_list)
-        n_sigs = len(sigs_list)
-        pairs = [corr_mat[i, j] for i in range(n_sigs) for j in range(i + 1, n_sigs)]
-        agreement = float(np.nanmean(pairs))
-        if np.isnan(agreement):
-            agreement = 0.0
-    else:
-        agreement = 0.0
-
-    # search_click_convergence — 검색↔클릭 min-max 정규화 후 상관계수
-    s_range = float(np.max(s_fw) - np.min(s_fw))
-    c_range = float(np.max(c_fw) - np.min(c_fw))
-    if s_range > EPS and c_range > EPS:
-        s_norm = (s_fw - np.min(s_fw)) / (s_range + EPS)
-        c_norm = (c_fw - np.min(c_fw)) / (c_range + EPS)
-        conv = float(np.corrcoef(s_norm, c_norm)[0, 1])
-        if np.isnan(conv):
-            conv = 0.0
-    else:
-        conv = 0.0
-
-    return {
-        # 순수 미래
-        "future_intensity": round(intensity, 6),
-        "future_acceleration": round(fa_accel, 6),
-        "peak_timing": round(peak_timing, 6),
-        "signal_agreement": round(agreement, 6),
-        "search_click_convergence": round(conv, 6),
-        # 과거+미래 혼합
-        "buzz_composite": round(composite, 6),
-        "momentum_score": round(momentum, 6),
-    }
+    return labels
 
 
 # ── column order ──────────────────────────────────────────────────────────────
@@ -483,12 +486,16 @@ def _sig_cols(p):
     # M. Wave Dynamics (6)
     c += [f"{p}_vol_ratio", f"{p}_range_squeeze", f"{p}_damping"]
     c += [f"{p}_zero_crossings_14d", f"{p}_direction_streak", f"{p}_reversal_3d"]
-    # N. Regime/Breakout (4)
+    # N. Regime/Breakout (5)
     c += [f"{p}_band_position", f"{p}_band_width", f"{p}_drawdown_14d", f"{p}_breakout_strength"]
+    c.append(f"{p}_band_approach")
     # O. Daily Momentum (4)
     c += [f"{p}_daily_return_1d", f"{p}_daily_returns_3d_avg"]
     c += [f"{p}_momentum_divergence", f"{p}_daily_accel_1d"]
-    return c  # 65개
+    # P. Daily Change (7)
+    for d in range(1, 8):
+        c.append(f"{p}_change_{d}d_ago")
+    return c  # 73개
 
 
 FEAT_COLS = []
@@ -509,6 +516,8 @@ FEAT_COLS += [
     "blog_search_dir_agree", "insta_search_dir_agree", "click_search_dir_agree",
     "blog_search_slope_gap", "insta_search_slope_gap",
     "multi_slope_count",
+    "blog_search_lead_magnitude", "insta_search_lead_magnitude", "click_search_lead_magnitude",
+    "weighted_slope_strength", "activation_spread",
 ]
 # surge (10: intensity×2 + accel×2 + lead_days per platform)
 FEAT_COLS += [
@@ -524,15 +533,18 @@ for _n in _W_MULTI:
     if _n >= 3:
         FEAT_COLS.append(f"multi_accel_{_n}d")
     FEAT_COLS.append(f"past_buzz_zscore_{_n}d")
-# calendar (day_of_week 제거)
+FEAT_COLS += ["conv_trend"]
+# calendar
 FEAT_COLS += ["month"]
 
 LABEL_COLS = [
-    "future_intensity", "future_acceleration", "peak_timing",
-    "signal_agreement", "search_click_convergence",
-    "buzz_composite", "momentum_score",
+    "intensity_5d", "intensity_10d", "intensity_15d",
+    "buzz_composite_5d", "buzz_composite_10d", "buzz_composite_15d",
+    "growth_5d", "growth_10d", "growth_15d",
+    "sustainability_5d", "sustainability_10d", "sustainability_15d",
+    "crash_5d", "crash_10d", "crash_15d",
 ]
-assert len(FEAT_COLS) == 310, f"expected 310, got {len(FEAT_COLS)}"
+assert len(FEAT_COLS) == 348, f"expected 348, got {len(FEAT_COLS)}"
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -733,7 +745,7 @@ def main():
     df.sort_values(["keyword", "date"], inplace=True)
     df.reset_index(drop=True, inplace=True)
 
-    out = _out_path()
+    out = OUT_PATH
     out.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out, index=False, encoding="utf-8-sig")
     print(f"  saved: {out}")
