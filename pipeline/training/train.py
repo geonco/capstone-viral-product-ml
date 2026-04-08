@@ -145,7 +145,7 @@ def tune_params(
             sample_weight=w_train,
             eval_set=[(X_valid, y_valid)],
             callbacks=[
-                lgb.early_stopping(stopping_rounds=50, verbose=False),
+                lgb.early_stopping(stopping_rounds=30, verbose=False),
                 lgb.log_evaluation(period=-1),
             ],
         )
@@ -184,7 +184,7 @@ def train_lgbm(
         sample_weight=w_train,
         eval_set=[(X_valid, y_valid)],
         callbacks=[
-            lgb.early_stopping(stopping_rounds=50, verbose=False),
+            lgb.early_stopping(stopping_rounds=30, verbose=False),
             lgb.log_evaluation(period=200),
         ],
     )
