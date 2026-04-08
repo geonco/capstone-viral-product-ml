@@ -15,10 +15,7 @@ import numpy as np
 import optuna
 import pandas as pd
 import shap
-from sklearn.metrics import (
-    mean_absolute_error, mean_squared_error,
-    accuracy_score, f1_score, confusion_matrix,
-)
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import train_test_split
 
 sys.path.append(os.path.dirname(__file__))
@@ -35,7 +32,6 @@ TRAIN_RATIO = 0.70
 VALID_RATIO = 0.15
 GAP_DAYS = 74  # LB(60) + FW(14), train↔valid↔test 간 누수 방지
 
-CLASSIFICATION_TARGETS = set()
 TARGET_CONFIG = {
     "future_intensity":        {"log": True},
     "future_acceleration":     {"log": False},
@@ -112,13 +108,6 @@ def evaluate(y_true, y_pred, split: str, target: str) -> dict:
     return {"split": split, "target": target, "rmse": rmse, "mae": mae}
 
 
-def evaluate_clf(y_true, y_pred, split: str, target: str) -> dict:
-    acc = float(accuracy_score(y_true, y_pred))
-    f1  = float(f1_score(y_true, y_pred, average="macro"))
-    print(f"  [{split:5s}] {target}  Acc={acc:.4f}  F1(macro)={f1:.4f}")
-    return {"split": split, "target": target, "accuracy": acc, "f1_macro": f1}
-
-
 # ── 날짜 기반 서브샘플링 ─────────────────────────────────────────────────────
 def _subsample_by_date(df, stride):
     # stride일 간격으로 날짜 추출, 해당 날짜의 모든 키워드 유지
@@ -185,8 +174,6 @@ def tune_params(
 ) -> dict:
     print(f"\nOptuna TPE 튜닝 시작: {target}  (trials={n_trials})")
 
-    is_clf = target in CLASSIFICATION_TARGETS
-
     def objective(trial: optuna.Trial) -> float:
         params = {**fixed_params}
         for name, spec in SEARCH_SPACE.items():
@@ -197,9 +184,7 @@ def tune_params(
                 params[name] = trial.suggest_int(name, spec[1], spec[2])
 
         params["n_estimators"] = 3000
-        ModelClass = lgb.LGBMClassifier if is_clf else lgb.LGBMRegressor
-
-        model = ModelClass(**params)
+        model = lgb.LGBMRegressor(**params)
         model.fit(
             X_train, y_train,
             sample_weight=w_train,
@@ -209,8 +194,6 @@ def tune_params(
                 lgb.log_evaluation(period=-1),
             ],
         )
-        if is_clf:
-            return -float(accuracy_score(y_valid, model.predict(X_valid)))
         return rmse_score(y_valid, model.predict(X_valid))
 
     study = optuna.create_study(
@@ -220,12 +203,10 @@ def tune_params(
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
 
     best = study.best_params
-    metric_name = "Acc" if is_clf else "RMSE"
-    metric_val = -study.best_value if is_clf else study.best_value
-    print(f"  best valid {metric_name}: {metric_val:.4f}")
+    print(f"  best valid RMSE: {study.best_value:.4f}")
     print(f"  best params: {best}")
 
-    out = {"target": target, f"best_{metric_name.lower()}": metric_val, "best_params": best}
+    out = {"target": target, "best_rmse": study.best_value, "best_params": best}
     path = os.path.join(dirs["metrics"], f"best_params_{target}.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2, ensure_ascii=False)
@@ -242,8 +223,7 @@ def train_lgbm(
     w_train=None,
 ) -> lgb.LGBMModel:
 
-    ModelClass = lgb.LGBMClassifier if target in CLASSIFICATION_TARGETS else lgb.LGBMRegressor
-    model = ModelClass(**params)
+    model = lgb.LGBMRegressor(**params)
     model.fit(
         X_train, y_train,
         sample_weight=w_train,
@@ -316,20 +296,13 @@ def run_model(
 
     model = train_lgbm(X_train, y_train, X_valid, y_valid, target, params, w_train)
 
-    is_clf = target in CLASSIFICATION_TARGETS
-    eval_fn = evaluate_clf if is_clf else evaluate
-
     results = []
     for split, X, y in [
         ("train", X_train, y_train),
         ("valid", X_valid, y_valid),
         ("test",  X_test,  y_test),
     ]:
-        results.append(eval_fn(y, model.predict(X), split, target))
-
-    if is_clf:
-        cm = confusion_matrix(y_test, model.predict(X_test))
-        np.savetxt(os.path.join(dirs["metrics"], f"confusion_{target}.csv"), cm, delimiter=",", fmt="%d")
+        results.append(evaluate(y, model.predict(X), split, target))
 
     shap_analysis(model, X_test, target, dirs)
     model.booster_.save_model(os.path.join(dirs["models"], f"lgbm_{target}.txt"))
@@ -356,19 +329,10 @@ def main(csv_path: str, target: str, do_tune: bool, n_trials: int, train_stride:
 
     # 타겟별 전처리
     cfg = TARGET_CONFIG.get(target, {"log": False})
-    is_clf = target in CLASSIFICATION_TARGETS
     use_log = cfg.get("log", False)
 
     base_params = {**DEFAULT_PARAMS}
-    if is_clf:
-        base_params["objective"] = "multiclass"
-        base_params["num_class"] = cfg.get("num_class", 4)
-        base_params["metric"] = "multi_logloss"
-        y_train = train_df[target].astype(int)
-        y_valid = valid_df[target].astype(int)
-        y_test  = test_df[target].astype(int)
-        w_train = None
-    elif use_log:
+    if use_log:
         y_train = np.log1p(train_df[target])
         y_valid = np.log1p(valid_df[target])
         y_test  = np.log1p(test_df[target])
@@ -393,7 +357,7 @@ def main(csv_path: str, target: str, do_tune: bool, n_trials: int, train_stride:
     )
 
     # log 변환 사용 시 원래 스케일 복원 평가
-    if use_log and not is_clf:
+    if use_log:
         model_path = os.path.join(dirs["models"], f"lgbm_{target}.txt")
         if os.path.exists(model_path):
             _model = lgb.Booster(model_file=model_path)
@@ -418,7 +382,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--data", type=str, default=None,
-        help="271피처 + 라벨 CSV 경로 (미지정 시 data/processed/ 내 최신 파일)",
+        help="310피처 + 라벨 CSV 경로 (미지정 시 data/processed/ 내 최신 파일)",
     )
     parser.add_argument(
         "--target", type=str, default="future_intensity",

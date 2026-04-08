@@ -12,12 +12,13 @@ warnings.filterwarnings("ignore")
 
 import numpy as np
 import pandas as pd
+from pathlib import Path
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 
 # ── 1. 데이터 로드 ──────────────────────────────────────────────
 
-BASE = "/home/dhsong/capstone/data/raw"
+BASE = str(Path(__file__).resolve().parent.parent.parent / "data" / "raw")
 
 # search: wide format (keyword × date)
 search_wide = pd.read_csv(f"{BASE}/search/absolute.csv", encoding="utf-8-sig")

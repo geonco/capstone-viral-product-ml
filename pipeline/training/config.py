@@ -1,9 +1,8 @@
-# 271피처 데이터셋 컬럼 정의
+# 310피처 데이터셋 컬럼 정의
 # build_dataset.py의 FEAT_COLS 생성 로직과 동일
 
 SIGNALS = ["search", "click", "blog", "instagram"]
 W_FULL = [3, 5, 7, 14, 30]
-W_OUT = [7, 14, 30]
 W_STAT = [7, 14, 30]
 
 
