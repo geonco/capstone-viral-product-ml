@@ -1,38 +1,11 @@
-"""
-LightGBM 바이럴 예측 모델  (Optuna TPE 하이퍼파라미터 튜닝 포함)
-- log_virality_score : log1p(future14_max / past60_mean)
-- peak_timing        : argmax(search_trend[t+1:t+30]) + 1  (1~30일)
-
-실험 결과는 자동으로 outputs/MMDD_사용자명_N/ 폴더에 저장됩니다.
-- 날짜_사용자명_번호 순서로 폴더가 생성되어 이전 실험 결과가 덮어씌워지지 않습니다.
-- 사용자명은 --user로 최초 1회 지정하면 outputs/.username에 저장되어 이후 생략 가능
-
-사용법:
-    # 최초 실행 (사용자명 등록)
-    python pipeline/training/train.py --user leehyn --data data/processed/dataset_v2.csv
-
-    # 이후 생략 가능
-    python pipeline/training/train.py --data data/processed/dataset_v2.csv
-
-    # Optuna TPE 튜닝 후 최적 파라미터로 학습 (trial 50회)
-    python pipeline/training/train.py --data data/processed/dataset_v2.csv --tune --n_trials 50
-
-    # 분할된 데이터 사용 (data/processed/splits/ 폴더의 train.csv, valid.csv, test.csv)
-    python pipeline/training/train.py --use_splits --tune --n_trials 50
-    
-출력 구조:
-    outputs/0403_leehyn_1/
-    ├── figures/          # SHAP 분석 그래프 (PNG)
-    ├── metrics/          # 평가 지표, 파라미터, SHAP 중요도 (CSV/JSON)
-    └── models/           # 학습된 LightGBM 모델 (TXT)
-"""
+# LightGBM 바이럴 예측 모델 (Optuna TPE 튜닝 포함)
 
 import argparse
 import json
 import os
 import sys
 import warnings
-from datetime import datetime
+from pathlib import Path
 
 import lightgbm as lgb
 import matplotlib.pyplot as plt
@@ -43,78 +16,32 @@ import shap
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import train_test_split
 
-# feature_engineering 모듈 import
-sys.path.append(os.path.dirname(__file__))
-from feature_engineering.feature_config import FEATURE_COLS
-from data_loader import load_csv
-from run_id import make_run_id, DIR_OUTPUTS, write_summary
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+from pipeline.config import (
+    ROOT, FEAT_COLS,
+    DATE_COL, TRAIN_RATIO, VALID_RATIO, GAP_DAYS,
+    TARGET_CONFIG, DEFAULT_PARAMS, SEARCH_SPACE,
+)
+from pipeline.training.data_loader import load_csv
 
 warnings.filterwarnings("ignore")
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-# ── 상수 ──────────────────────────────────────────────────────────────────────
-TARGET_VIRALITY = "log_virality_score"
-TARGET_TIMING   = "peak_time"
-DATE_COL        = "date"
-
-TRAIN_RATIO = 0.70
-VALID_RATIO = 0.15
-# TEST_RATIO  = 0.15
-
-DEFAULT_PARAMS = {
-    "boosting_type"    : "gbdt",
-    "n_estimators"     : 1000,
-    "learning_rate"    : 0.05,
-    "num_leaves"       : 64,
-    "max_depth"        : -1,
-    "min_child_samples": 20,
-    "subsample"        : 0.8,
-    "colsample_bytree" : 0.8,
-    "reg_alpha"        : 0.1,
-    "reg_lambda"       : 0.1,
-    "random_state"     : 42,
-    "n_jobs"           : -1,
-    "verbose"          : -1,
-}
-
-# Optuna TPE 탐색 범위
-SEARCH_SPACE = {
-    "learning_rate"    : ("float", 1e-3, 0.3,   True),   # (type, low, high, log)
-    "num_leaves"       : ("int",   16,   256),
-    "max_depth"        : ("int",   3,    12),
-    "min_child_samples": ("int",   5,    100),
-    "subsample"        : ("float", 0.5,  1.0,   False),
-    "colsample_bytree" : ("float", 0.5,  1.0,   False),
-    "reg_alpha"        : ("float", 1e-4, 10.0,  True),
-    "reg_lambda"       : ("float", 1e-4, 10.0,  True),
-}
-
-_ROOT       = os.path.join(os.path.dirname(__file__), "..", "..")
-DIR_OUTPUTS = os.path.join(_ROOT, "outputs")
+def _make_run_dir(target: str = ""):
+    from datetime import datetime
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run = os.path.join(str(ROOT), "outputs", f"run_{stamp}_{target}" if target else f"run_{stamp}")
+    dirs = {
+        "figures": os.path.join(run, "figures"),
+        "metrics": os.path.join(run, "metrics"),
+        "models":  os.path.join(run, "models"),
+    }
+    for d in dirs.values():
+        os.makedirs(d, exist_ok=True)
+    return dirs
 
 
-def get_experiment_dir(user_arg: str | None = None) -> str:
-    """날짜_사용자명_번호 형식의 다음 실험 폴더명 반환"""
-    return make_run_id(DIR_OUTPUTS, user_arg)
-
-
-def setup_experiment_dirs(experiment_name: str) -> tuple[str, str, str]:
-    """실험별 폴더 생성 및 경로 반환"""
-    exp_dir = os.path.join(DIR_OUTPUTS, experiment_name)
-    
-    dir_figures = os.path.join(exp_dir, "figures")
-    dir_metrics = os.path.join(exp_dir, "metrics") 
-    dir_models  = os.path.join(exp_dir, "models")
-    
-    # 폴더 생성
-    os.makedirs(dir_figures, exist_ok=True)
-    os.makedirs(dir_metrics, exist_ok=True)
-    os.makedirs(dir_models,  exist_ok=True)
-    
-    return dir_figures, dir_metrics, dir_models
-
-
-# ── 지표 ──────────────────────────────────────────────────────────────────────
+# 평가 지표 — RMSE, MAE, naive baseline 대비 gain
 def rmse_score(y_true, y_pred) -> float:
     return float(np.sqrt(mean_squared_error(y_true, y_pred)))
 
@@ -123,39 +50,83 @@ def evaluate(y_true, y_pred, split: str, target: str) -> dict:
     rmse = rmse_score(y_true, y_pred)
     mae  = float(mean_absolute_error(y_true, y_pred))
     print(f"  [{split:5s}] {target}  RMSE={rmse:.4f}  MAE={mae:.4f}")
+
+    # test set에서 naive baseline 비교
+    if split == "test":
+        y_arr = np.array(y_true)
+        bl_mean = float(mean_absolute_error(y_arr, np.full_like(y_arr, y_arr.mean())))
+        bl_zero = float(mean_absolute_error(y_arr, np.zeros_like(y_arr)))
+        best_bl = min(bl_mean, bl_zero)
+        gain = (1 - mae / best_bl) * 100 if best_bl > 0 else 0
+        print(f"         baseline MAE: mean={bl_mean:.4f} zero={bl_zero:.4f} → gain: {gain:+.1f}%")
+
     return {"split": split, "target": target, "rmse": rmse, "mae": mae}
 
 
-# ── 데이터 분할 ───────────────────────────────────────────────────────────────
-def split_data(df: pd.DataFrame):
-    if DATE_COL in df.columns:
-        print(f"'{DATE_COL}' 컬럼 감지 → 시계열 순서 기반 분할")
-        df = df.sort_values(DATE_COL).reset_index(drop=True)
-        n  = len(df)
-        t1 = int(n * TRAIN_RATIO)
-        t2 = int(n * (TRAIN_RATIO + VALID_RATIO))
-        return df.iloc[:t1], df.iloc[t1:t2], df.iloc[t2:]
-    else:
+# 날짜 기반 서브샘플링 — stride일 간격으로 날짜 추출, 해당 날짜의 모든 키워드 유지
+def _subsample_by_date(df, stride):
+    # stride일 간격으로 날짜 추출, 해당 날짜의 모든 키워드 유지
+    if stride <= 1:
+        return df
+    dates = np.sort(df[DATE_COL].unique())
+    keep_dates = dates[::stride]
+    return df[df[DATE_COL].isin(keep_dates)]
+
+
+# 데이터 분할 — 시계열 기반 train/valid/test, gap으로 누수 방지
+def split_data(df: pd.DataFrame, train_stride: int = 1):
+    if DATE_COL not in df.columns:
         print("날짜 컬럼 없음 → 랜덤 분할")
         train, tmp  = train_test_split(df, test_size=1 - TRAIN_RATIO, random_state=42)
         val_ratio   = VALID_RATIO / (1 - TRAIN_RATIO)
         valid, test = train_test_split(tmp, test_size=1 - val_ratio, random_state=42)
         return train, valid, test
 
+    print(f"시계열 분할 (gap={GAP_DAYS}일)")
+    df = df.copy()
+    df[DATE_COL] = pd.to_datetime(df[DATE_COL])
+    df = df.sort_values(DATE_COL).reset_index(drop=True)
 
-# ── Optuna TPE 튜닝 ───────────────────────────────────────────────────────────
+    dates = np.sort(df[DATE_COL].unique())
+    n = len(dates)
+    train_end = dates[int(n * TRAIN_RATIO)]
+    valid_start = train_end + pd.Timedelta(days=GAP_DAYS)
+
+    remaining = dates[dates >= valid_start]
+    if len(remaining) == 0:
+        raise ValueError("gap 적용 후 valid/test 데이터 없음")
+    valid_end = remaining[int(len(remaining) * 0.5)]
+    test_start = valid_end + pd.Timedelta(days=GAP_DAYS)
+
+    train = df[df[DATE_COL] <= train_end]
+    valid = df[(df[DATE_COL] >= valid_start) & (df[DATE_COL] <= valid_end)]
+    test  = df[df[DATE_COL] >= test_start]
+
+    # train/valid만 서브샘플링, test는 stride=1 유지
+    if train_stride > 1:
+        train = _subsample_by_date(train, train_stride)
+        valid = _subsample_by_date(valid, train_stride)
+
+    print(f"  train: ~{train[DATE_COL].min().date()} ~ {train[DATE_COL].max().date()} ({len(train):,})")
+    print(f"  gap: {GAP_DAYS}일")
+    print(f"  valid: ~{valid[DATE_COL].min().date()} ~ {valid[DATE_COL].max().date()} ({len(valid):,})")
+    print(f"  gap: {GAP_DAYS}일")
+    print(f"  test:  ~{test[DATE_COL].min().date()} ~ {test[DATE_COL].max().date()} ({len(test):,})")
+    if train_stride > 1:
+        print(f"  train/valid stride: {train_stride}일 (test는 stride=1)")
+    return train, valid, test
+
+
+# Optuna TPE 튜닝 — SEARCH_SPACE 기반 하이퍼파라미터 탐색, best params JSON 저장
 def tune_params(
     X_train, y_train,
     X_valid, y_valid,
     target: str,
     n_trials: int,
     fixed_params: dict,
-    dir_metrics: str,
+    dirs: dict,
+    w_train=None,
 ) -> dict:
-    """
-    Optuna TPE Sampler로 valid RMSE 최소화 파라미터 탐색.
-    이전 trial 결과를 반영해 유망한 파라미터 범위를 점점 좁혀감.
-    """
     print(f"\nOptuna TPE 튜닝 시작: {target}  (trials={n_trials})")
 
     def objective(trial: optuna.Trial) -> float:
@@ -167,11 +138,11 @@ def tune_params(
             elif spec[0] == "int":
                 params[name] = trial.suggest_int(name, spec[1], spec[2])
 
-        params["n_estimators"] = 1000  # early stopping 으로 결정
-
+        params["n_estimators"] = 3000
         model = lgb.LGBMRegressor(**params)
         model.fit(
             X_train, y_train,
+            sample_weight=w_train,
             eval_set=[(X_valid, y_valid)],
             callbacks=[
                 lgb.early_stopping(stopping_rounds=30, verbose=False),
@@ -187,30 +158,30 @@ def tune_params(
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
 
     best = study.best_params
-    print(f"  최적 valid RMSE : {study.best_value:.4f}")
-    print(f"  최적 파라미터   : {best}")
+    print(f"  best valid RMSE: {study.best_value:.4f}")
+    print(f"  best params: {best}")
 
-    # 결과 저장
     out = {"target": target, "best_rmse": study.best_value, "best_params": best}
-    path = os.path.join(dir_metrics, f"best_params_{target}.json")
+    path = os.path.join(dirs["metrics"], f"best_params_{target}.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2, ensure_ascii=False)
-    print(f"  저장: {path}")
 
     return {**fixed_params, **best}
 
 
-# ── LightGBM 학습 ─────────────────────────────────────────────────────────────
+# LightGBM 학습 — early stopping 적용, 최적 트리 수 출력
 def train_lgbm(
     X_train, y_train,
     X_valid, y_valid,
     target: str,
     params: dict,
-) -> lgb.LGBMRegressor:
+    w_train=None,
+) -> lgb.LGBMModel:
 
     model = lgb.LGBMRegressor(**params)
     model.fit(
         X_train, y_train,
+        sample_weight=w_train,
         eval_set=[(X_valid, y_valid)],
         callbacks=[
             lgb.early_stopping(stopping_rounds=30, verbose=False),
@@ -221,36 +192,39 @@ def train_lgbm(
     return model
 
 
-def shap_analysis(model: lgb.LGBMRegressor, X: pd.DataFrame, target: str, dir_figures: str, dir_metrics: str):
-    print(f"\nSHAP 분석: {target}")
+# SHAP 분석 — feature importance 시각화(bar/beeswarm) 및 CSV 저장
+def shap_analysis(model: lgb.LGBMModel, X: pd.DataFrame, target: str, dirs: dict):
     explainer   = shap.TreeExplainer(model)
     shap_values = explainer.shap_values(X)
 
-    # bar plot
+    # multiclass: list of arrays → 클래스별 평균 절대값
+    if isinstance(shap_values, list):
+        shap_abs = np.mean([np.abs(sv) for sv in shap_values], axis=0)
+    else:
+        shap_abs = np.abs(shap_values)
+
     plt.figure()
-    shap.summary_plot(shap_values, X, plot_type="bar", show=False)
+    shap.summary_plot(shap_abs, X, plot_type="bar", show=False)
     plt.title(f"SHAP Importance (bar) — {target}")
     plt.tight_layout()
-    plt.savefig(os.path.join(dir_figures, f"shap_bar_{target}.png"), dpi=150)
+    plt.savefig(os.path.join(dirs["figures"], f"shap_bar_{target}.png"), dpi=150)
     plt.close()
 
-    # beeswarm plot
     plt.figure()
-    shap.summary_plot(shap_values, X, show=False)
+    shap.summary_plot(shap_abs, X, show=False)
     plt.title(f"SHAP Beeswarm — {target}")
     plt.tight_layout()
-    plt.savefig(os.path.join(dir_figures, f"shap_beeswarm_{target}.png"), dpi=150)
+    plt.savefig(os.path.join(dirs["figures"], f"shap_beeswarm_{target}.png"), dpi=150)
     plt.close()
 
-    # 중요도 CSV
     imp_df = (
-        pd.DataFrame({"feature": X.columns, "mean_abs_shap": np.abs(shap_values).mean(0)})
+        pd.DataFrame({"feature": X.columns, "mean_abs_shap": shap_abs.mean(0)})
         .sort_values("mean_abs_shap", ascending=False)
     )
-    imp_df.to_csv(os.path.join(dir_metrics, f"shap_importance_{target}.csv"), index=False)
-    print(f"  저장 완료 → figures/shap_*_{target}.png, metrics/shap_importance_{target}.csv")
+    imp_df.to_csv(os.path.join(dirs["metrics"], f"shap_importance_{target}.csv"), index=False)
 
 
+# 모델 파이프라인 — 튜닝 → 학습 → 평가 → SHAP → 모델 저장
 def run_model(
     X_train, y_train,
     X_valid, y_valid,
@@ -259,31 +233,23 @@ def run_model(
     base_params: dict,
     do_tune: bool,
     n_trials: int,
-    dir_figures: str,
-    dir_metrics: str,
-    dir_models: str,
+    dirs: dict,
+    w_train=None,
 ) -> list[dict]:
 
     print(f"\n{'='*55}")
-    print(f"  {target} 모델")
+    print(f"  {target}")
     print(f"{'='*55}")
 
     if do_tune:
         params = tune_params(
             X_train, y_train, X_valid, y_valid,
-            target, n_trials, base_params, dir_metrics,
+            target, n_trials, base_params, dirs, w_train,
         )
     else:
-        saved_path = os.path.join(dir_metrics, f"best_params_{target}.json")
-        if os.path.isfile(saved_path):
-            with open(saved_path, encoding="utf-8") as f:
-                saved = json.load(f)
-            params = {**base_params, **saved["best_params"]}
-            print(f"  저장된 최적 파라미터 로드: {saved_path}  (best_rmse={saved['best_rmse']:.4f})")
-        else:
-            params = base_params
+        params = base_params
 
-    model = train_lgbm(X_train, y_train, X_valid, y_valid, target, params)
+    model = train_lgbm(X_train, y_train, X_valid, y_valid, target, params, w_train)
 
     results = []
     for split, X, y in [
@@ -293,144 +259,118 @@ def run_model(
     ]:
         results.append(evaluate(y, model.predict(X), split, target))
 
-    shap_analysis(model, X_test, target, dir_figures, dir_metrics)
-    model.booster_.save_model(os.path.join(dir_models, f"lgbm_{target}.txt"))
+    shap_analysis(model, X_test, target, dirs)
+    model.booster_.save_model(os.path.join(dirs["models"], f"lgbm_{target}.txt"))
 
     return results
 
 
-# ── 메인 ──────────────────────────────────────────────────────────────────────
-def main(csv_path: str, use_splits: bool, do_tune: bool, n_trials: int, user: str | None = None, targets: list[str] | None = None):
-    # 실험 폴더 설정
-    experiment_name = get_experiment_dir(user)
-    dir_figures, dir_metrics, dir_models = setup_experiment_dirs(experiment_name)
-    
-    print(f"실험 폴더 생성: {experiment_name}")
-    print(f"  figures → {dir_figures}")
-    print(f"  metrics → {dir_metrics}")
-    print(f"  models  → {dir_models}")
+# 메인 — CSV 로드 → 분할 → 타겟별 학습 실행
+def main(csv_path: str, target: str, do_tune: bool, n_trials: int, train_stride: int = 3):
+    dirs = _make_run_dir(target)
+    print(f"output → {os.path.dirname(dirs['figures'])}")
+    print(f"target: {target}")
 
-    # 1. 데이터 로드 (컬럼 검증 및 재정렬 포함)
-    if use_splits:
-        print("분할된 데이터 사용: data_processed/splits/")
-        train_df = load_csv("data_processed/splits/train.csv")
-        valid_df = load_csv("data_processed/splits/valid.csv")
-        test_df  = load_csv("data_processed/splits/test.csv")
-        print(f"train={len(train_df)}  valid={len(valid_df)}  test={len(test_df)}")
+    df = load_csv(csv_path)
+    print(f"shape: {df.shape}")
+
+    train_df, valid_df, test_df = split_data(df, train_stride=train_stride)
+    print(f"train={len(train_df)}  valid={len(valid_df)}  test={len(test_df)}")
+    print(f"features: {len(FEAT_COLS)}")
+
+    X_train = train_df[FEAT_COLS]
+    X_valid = valid_df[FEAT_COLS]
+    X_test  = test_df[FEAT_COLS]
+
+    # 타겟별 전처리
+    cfg = TARGET_CONFIG.get(target, {"log": False})
+    use_log = cfg.get("log", False)
+
+    base_params = {**DEFAULT_PARAMS}
+    if use_log:
+        y_train = np.log1p(train_df[target])
+        y_valid = np.log1p(valid_df[target])
+        y_test  = np.log1p(test_df[target])
+        w_train = None
+        print("log1p 변환 적용")
     else:
-        df = load_csv(csv_path)
-        print(f"데이터 로드: {df.shape}  ({csv_path})")
-        
-        # 2. 분할
-        train_df, valid_df, test_df = split_data(df)
-        print(f"train={len(train_df)}  valid={len(valid_df)}  test={len(test_df)}")
-    
-    print(f"feature 수: {len(FEATURE_COLS)}")
+        y_train = train_df[target]
+        y_valid = valid_df[target]
+        y_test  = test_df[target]
+        w_train = None
 
-    X_train = train_df[FEATURE_COLS]
-    X_valid = valid_df[FEATURE_COLS]
-    X_test  = test_df[FEATURE_COLS]
+    results = run_model(
+        X_train, y_train,
+        X_valid, y_valid,
+        X_test,  y_test,
+        target     = target,
+        base_params= base_params,
+        do_tune    = do_tune,
+        n_trials   = n_trials,
+        dirs       = dirs,
+        w_train    = w_train,
+    )
 
-    if targets is None:
-        targets = [TARGET_VIRALITY, TARGET_TIMING]
+    # log 변환 사용 시 원래 스케일 복원 평가
+    if use_log:
+        model_path = os.path.join(dirs["models"], f"lgbm_{target}.txt")
+        if os.path.exists(model_path):
+            _model = lgb.Booster(model_file=model_path)
+            print(f"\n  [원래 스케일 복원 평가]")
+            for split, X, y_orig in [
+                ("train", X_train, train_df[target]),
+                ("valid", X_valid, valid_df[target]),
+                ("test",  X_test,  test_df[target]),
+            ]:
+                pred_orig = np.expm1(_model.predict(X))
+                evaluate(y_orig, pred_orig, split, f"{target}_restored")
 
-    target_configs = {
-        TARGET_VIRALITY: {**DEFAULT_PARAMS},
-        TARGET_TIMING:   {**DEFAULT_PARAMS, "objective": "regression_l1"},
-    }
-
-    results = []
-    for target in targets:
-        results += run_model(
-            X_train, train_df[target],
-            X_valid, valid_df[target],
-            X_test,  test_df[target],
-            target     = target,
-            base_params= target_configs[target],
-            do_tune    = do_tune,
-            n_trials   = n_trials,
-            dir_figures= dir_figures,
-            dir_metrics= dir_metrics,
-            dir_models = dir_models,
-        )
-
-    # 5. 결과 저장
     res_df = pd.DataFrame(results)
-    res_df.to_csv(os.path.join(dir_metrics, "evaluation_results.csv"), index=False)
+    res_df.to_csv(os.path.join(dirs["metrics"], "evaluation_results.csv"), index=False)
 
     print(f"\n{'='*55}")
-    print("최종 평가 결과")
-    print("="*55)
     print(res_df.to_string(index=False))
-    print(f"\n모든 결과 저장 완료 → outputs/{experiment_name}/figures/, metrics/, models/")
-
-    # 6. 실험 요약 문서 저장
-    exp_dir   = os.path.join(DIR_OUTPUTS, experiment_name)
-    now_str   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    data_desc = "data/processed/splits/ (train/valid/test.csv)" if use_splits else csv_path
-    split_desc = "외부 분할 파일 사용" if use_splits else f"자동 분할 (train {int(TRAIN_RATIO*100)}% / valid {int(VALID_RATIO*100)}% / test {int((1-TRAIN_RATIO-VALID_RATIO)*100)}%)"
-    tune_desc  = f"Optuna TPE ({n_trials} trials)" if do_tune else "비활성화 (기본 파라미터)"
-
-    rows = []
-    for r in results:
-        rows.append(f"| {r['target']} | {r['split']} | {r['rmse']:.4f} | {r['mae']:.4f} |")
-    result_table = "\n".join(rows)
-
-    markdown = f"""# 실험 요약 — {experiment_name}
-
-## 기본 정보
-- 유형: LightGBM 학습
-- 일시: {now_str}
-- 데이터: {data_desc}
-- 분할: {split_desc}
-- 튜닝: {tune_desc}
-- feature 수: {len(FEATURE_COLS)}
-- 데이터 크기: train {len(train_df)} / valid {len(valid_df)} / test {len(test_df)}
-
-## 평가 결과
-
-| target | split | RMSE | MAE |
-|--------|-------|------|-----|
-{result_table}
-
-## 생성 파일
-- metrics/evaluation_results.csv
-- metrics/best_params_{{target}}.json (튜닝 시)
-- metrics/shap_importance_{{target}}.csv
-- figures/shap_bar_{{target}}.png
-- figures/shap_beeswarm_{{target}}.png
-- models/lgbm_{{target}}.txt
-"""
-    write_summary(exp_dir, markdown)
+    print(f"{'='*55}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--data", type=str, default="data/processed/dataset_v2.csv",
-        help="feature + target 컬럼이 포함된 CSV 경로",
+        "--data", type=str, default=os.path.join(str(ROOT), "data", "processed", "dataset.csv"),
+        help="피처 + 라벨 CSV 경로",
     )
     parser.add_argument(
-        "--use_splits", action="store_true",
-        help="data/processed/splits/ 폴더의 train.csv, valid.csv, test.csv 사용",
+        "--target", type=str, default="sustainability_10d",
+        help="학습 타겟 (intensity/buzz_composite/growth/sustainability/crash + _5d/_10d/_15d, 또는 all)",
     )
     parser.add_argument(
         "--tune", action="store_true",
         help="Optuna TPE 하이퍼파라미터 튜닝 활성화",
     )
     parser.add_argument(
-        "--n_trials", type=int, default=50,
-        help="Optuna trial 횟수 (기본값: 50)",
+        "--n_trials", type=int, default=25,
+        help="Optuna trial 횟수 (기본값: 25, early stopping 적용)",
     )
     parser.add_argument(
-        "--user", type=str, default=None,
-        help="실험자 이름 (최초 1회 지정하면 outputs/.username에 저장됨)",
+        "--gpu", action="store_true",
+        help="GPU 학습 활성화 (CUDA 필요)",
     )
     parser.add_argument(
-        "--targets", type=str, nargs="+",
-        choices=[TARGET_VIRALITY, TARGET_TIMING],
-        default=[TARGET_VIRALITY, TARGET_TIMING],
-        help="학습할 타깃 목록 (기본값: 둘 다). 예: --targets peak_time",
+        "--train-stride", type=int, default=3,
+        help="train/valid 서브샘플링 간격 (test는 항상 stride=1, 기본값: 3)",
     )
     args = parser.parse_args()
-    main(args.data, args.use_splits, args.tune, args.n_trials, args.user, args.targets)
+    if args.gpu:
+        DEFAULT_PARAMS["device"] = "cuda"
+        print("GPU mode enabled")
+
+    ALL_TARGETS = [
+        "intensity_5d", "intensity_10d", "intensity_15d",
+        "buzz_composite_5d", "buzz_composite_10d", "buzz_composite_15d",
+        "growth_5d", "growth_10d", "growth_15d",
+        "sustainability_5d", "sustainability_10d", "sustainability_15d",
+        "crash_5d", "crash_10d", "crash_15d",
+    ]
+    targets = ALL_TARGETS if args.target == "all" else [args.target]
+    for t in targets:
+        main(args.data, t, args.tune, args.n_trials, args.train_stride)

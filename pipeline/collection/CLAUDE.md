@@ -1,1 +1,0 @@
-@pipeline/collection/README.md
