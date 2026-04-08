@@ -430,27 +430,31 @@ def compute_labels(s_fw, c_fw, b_fw, i_fw, s_lb, c_lb, b_lb, i_lb, kw_stats=None
         # intensity — 4채널 합산 평균
         labels[f"intensity_{w}d"] = round(float(np.mean(fw_w)), 6)
 
-        # buzz_composite — 4채널 z-score 가중합 (lookback 기준)
+        # buzz_composite — 4채널 z-score 가중합 (lookback 기준, clip [-10,10])
         comp = 0.0
         for sig, wt in weights.items():
             mu = float(np.mean(sigs_lb[sig]))
             sigma = float(np.std(sigs_lb[sig]))
             fw_mean = float(np.mean(sigs_fw[sig][:w]))
             z = (fw_mean - mu) / (sigma + EPS) if sigma > EPS else 0.0
-            comp += wt * z
+            comp += wt * float(np.clip(z, -10, 10))
         labels[f"buzz_composite_{w}d"] = round(comp, 6)
 
-        # growth — 과거 대비 4채널 가중 성장률
+        # growth — 과거 대비 4채널 가중 성장비 (ratio, 항상 양수. 1=변화없음, 2=2배)
         gr = 0.0
         for sig, wt in weights.items():
             past = float(np.mean(sigs_lb[sig][-w:]))
             future = float(np.mean(sigs_fw[sig][:w]))
-            gr += wt * ((future - past) / (past + EPS))
-        labels[f"growth_{w}d"] = round(float(np.clip(gr, -5, 50)), 6)
+            ratio = future / (past + EPS) if past > EPS else 1.0
+            gr += wt * ratio
+        labels[f"growth_{w}d"] = round(float(np.clip(gr, 0.01, 100)), 6)
 
-        # sustainability — 현재 대비 미래 평균 유지율 (>1 성장, <1 하락)
+        # sustainability — 현재 대비 미래 평균 유지율, 분모 floor 적용
+        combined_lb = s_lb + c_lb + b_lb + i_lb
         current = float(fw_w[0])
-        labels[f"sustainability_{w}d"] = round(float(np.mean(fw_w)) / (current + EPS), 6)
+        floor = max(current, float(np.mean(combined_lb[-7:])))
+        sust = float(np.mean(fw_w)) / (floor + EPS)
+        labels[f"sustainability_{w}d"] = round(float(np.clip(sust, 0, 5)), 6)
 
         # crash — 현재에서 최저점까지 하락률 (0=안빠짐, 양수=빠짐)
         cr = (current - float(np.min(fw_w))) / (current + EPS) if current > EPS else 0.0
