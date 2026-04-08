@@ -1,11 +1,6 @@
-"""
-키워드 행동 클러스터 기반 lead-lag 교차상관 분석
-
-각 키워드의 시계열 특성(검색량 수준, spikiness, 변동성, 소셜 커버리지)으로
-클러스터링한 뒤, 클러스터별로 blog/instagram/click → search 간
-lead-lag 교차상관을 계산하여 viral/spiky 키워드와 stable 키워드 간
-lead-lag 패턴 차이 검증
-"""
+# 키워드 행동 클러스터 기반 lead-lag 교차상관 분석
+# 시계열 특성으로 클러스터링 후 클러스터별 blog/instagram/click → search 간
+# lead-lag 교차상관 계산, viral/spiky vs stable 키워드 간 패턴 차이 검증
 
 import warnings, sys
 warnings.filterwarnings("ignore")
@@ -16,9 +11,12 @@ from pathlib import Path
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 
-# ── 1. 데이터 로드 ──────────────────────────────────────────────
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+from pipeline.config import RAW, SIGNALS
 
-BASE = str(Path(__file__).resolve().parent.parent.parent / "data" / "raw")
+# 1. 데이터 로드
+
+BASE = str(RAW)
 
 # search: wide format (keyword × date)
 search_wide = pd.read_csv(f"{BASE}/search/absolute.csv", encoding="utf-8-sig")
@@ -44,7 +42,7 @@ df = search_long.merge(click_long, on=["keyword", "date"], how="inner")
 df = df.merge(some, on=["keyword", "date"], how="inner")
 
 # 결측 → 0
-for c in ["search", "click", "blog", "instagram"]:
+for c in SIGNALS:
     df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
 common_kw = df["keyword"].unique()
@@ -52,7 +50,7 @@ print(f"공통 키워드 수: {len(common_kw)}")
 print(f"날짜 범위: {df['date'].min().date()} ~ {df['date'].max().date()}")
 print(f"총 행 수: {len(df):,}")
 
-# ── 2. 키워드별 요약 피처 ──────────────────────────────────────
+# 2. 키워드별 요약 피처
 
 def keyword_features(g):
     s = g["search"]
@@ -81,7 +79,7 @@ def keyword_features(g):
 feat = df.groupby("keyword").apply(keyword_features).reset_index()
 print(f"\n피처 통계:\n{feat.describe().round(3)}")
 
-# ── 3. KMeans 클러스터링 (k=4) ──────────────────────────────────
+# 3. KMeans 클러스터링 (k=4)
 
 cluster_cols = [
     "search_mean", "search_spikiness", "search_ret_std",
@@ -152,10 +150,10 @@ summary = feat.groupby("cluster_name").agg(
 ).round(3)
 print(summary.to_string())
 
-# ── 4. 클러스터별 lead-lag 교차상관 분석 ──────────────────────
+# 4. 클러스터별 lead-lag 교차상관 분석
 
 def xcorr_at_lags(x, y, lags):
-    """x, y 시계열 간 lag별 Pearson 상관. lag>0 → x가 y보다 lag일 앞섬."""
+    # x, y 시계열 간 lag별 Pearson 상관. lag>0 → x가 y보다 lag일 앞섬
     x = np.array(x, dtype=float)
     y = np.array(y, dtype=float)
     # z-score
@@ -270,7 +268,7 @@ for cname in sorted(feat["cluster_name"].unique()):
               f"corr@0={row['corr_at_lag0']:.3f}")
     print("└" + "─" * 80)
 
-# ── 5. Viral/Spiky 클러스터 심층 분석 ──────────────────────────
+# 5. Viral/Spiky 클러스터 심층 분석
 
 print("\n" + "=" * 100)
 print("── Viral/Spiky 클러스터 vs Stable 클러스터 비교 ──")
@@ -318,7 +316,7 @@ for _, row in stable_kws.iterrows():
     print(f"  {row['keyword']:20s}  search_mean={row['search_mean']:8.1f}  "
           f"spikiness={row['search_spikiness']:6.1f}  max_ret={row['search_max_daily_ret']:.2f}")
 
-# ── 5b. 보조 분석: k=5 시도 ──────────────────────────────────
+# 5b. 보조 분석: k=5 시도
 
 print("\n\n" + "=" * 100)
 print("── 보조: k=5 클러스터링 ──")

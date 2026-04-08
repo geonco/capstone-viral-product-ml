@@ -5,7 +5,7 @@ import warnings
 
 import pandas as pd
 
-from config import ALL_COLS, OPTIONAL_COLS, REQUIRED_COLS
+from pipeline.config import ALL_COLS, OPTIONAL_COLS, REQUIRED_COLS
 
 
 def _read_raw(csv_path: str) -> pd.DataFrame:

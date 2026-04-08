@@ -1,11 +1,11 @@
-# LightGBM 바이럴 예측 모델 (Optuna TPE 하이퍼파라미터 튜닝 포함)
-# 15개 타겟 (5종 × 3윈도우): intensity, buzz_composite, growth, sustainability, crash
+# LightGBM 바이럴 예측 모델 (Optuna TPE 튜닝 포함)
 
 import argparse
 import json
 import os
 import sys
 import warnings
+from pathlib import Path
 
 import lightgbm as lgb
 import matplotlib.pyplot as plt
@@ -16,72 +16,21 @@ import shap
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import train_test_split
 
-sys.path.append(os.path.dirname(__file__))
-from config import FEAT_COLS
-from data_loader import load_csv
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+from pipeline.config import (
+    ROOT, FEAT_COLS,
+    DATE_COL, TRAIN_RATIO, VALID_RATIO, GAP_DAYS,
+    TARGET_CONFIG, DEFAULT_PARAMS, SEARCH_SPACE,
+)
+from pipeline.training.data_loader import load_csv
 
 warnings.filterwarnings("ignore")
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-# ── 상수 ──────────────────────────────────────────────────────────────────────
-DATE_COL = "date"
-
-TRAIN_RATIO = 0.70
-VALID_RATIO = 0.15
-GAP_DAYS = 75  # LB(60) + FW(15), train↔valid↔test 간 누수 방지
-
-TARGET_CONFIG = {
-    "intensity_5d":            {"log": True},
-    "intensity_10d":           {"log": True},
-    "intensity_15d":           {"log": True},
-    "buzz_composite_5d":       {"log": False},
-    "buzz_composite_10d":      {"log": False},
-    "buzz_composite_15d":      {"log": False},
-    "growth_5d":               {"log": True},
-    "growth_10d":              {"log": True},
-    "growth_15d":              {"log": True},
-    "sustainability_5d":       {"log": False},
-    "sustainability_10d":      {"log": False},
-    "sustainability_15d":      {"log": False},
-    "crash_5d":                {"log": False},
-    "crash_10d":               {"log": False},
-    "crash_15d":               {"log": False},
-}
-
-DEFAULT_PARAMS = {
-    "boosting_type"    : "gbdt",
-    "n_estimators"     : 1000,
-    "learning_rate"    : 0.05,
-    "num_leaves"       : 64,
-    "max_depth"        : -1,
-    "min_child_samples": 20,
-    "subsample"        : 0.8,
-    "colsample_bytree" : 0.8,
-    "reg_alpha"        : 0.1,
-    "reg_lambda"       : 0.1,
-    "random_state"     : 42,
-    "n_jobs"           : -1,
-    "verbose"          : -1,
-}
-
-# Optuna TPE 탐색 범위
-SEARCH_SPACE = {
-    "learning_rate"    : ("float", 0.01, 0.15,  True),
-    "num_leaves"       : ("int",   15,   127),
-    "max_depth"        : ("int",   4,    10),
-    "min_child_samples": ("int",   50,   500),
-    "subsample"        : ("float", 0.6,  0.95,  False),
-    "colsample_bytree" : ("float", 0.4,  0.9,   False),
-    "reg_alpha"        : ("float", 1e-3, 10.0,  True),
-    "reg_lambda"       : ("float", 1e-3, 10.0,  True),
-}
-
-_ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
-
 def _make_run_dir(target: str = ""):
     from datetime import datetime
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run = os.path.join(_ROOT, "outputs", f"run_{stamp}_{target}" if target else f"run_{stamp}")
+    run = os.path.join(str(ROOT), "outputs", f"run_{stamp}_{target}" if target else f"run_{stamp}")
     dirs = {
         "figures": os.path.join(run, "figures"),
         "metrics": os.path.join(run, "metrics"),
@@ -92,7 +41,7 @@ def _make_run_dir(target: str = ""):
     return dirs
 
 
-# ── 지표 ──────────────────────────────────────────────────────────────────────
+# 평가 지표 — RMSE, MAE, naive baseline 대비 gain
 def rmse_score(y_true, y_pred) -> float:
     return float(np.sqrt(mean_squared_error(y_true, y_pred)))
 
@@ -114,7 +63,7 @@ def evaluate(y_true, y_pred, split: str, target: str) -> dict:
     return {"split": split, "target": target, "rmse": rmse, "mae": mae}
 
 
-# ── 날짜 기반 서브샘플링 ─────────────────────────────────────────────────────
+# 날짜 기반 서브샘플링 — stride일 간격으로 날짜 추출, 해당 날짜의 모든 키워드 유지
 def _subsample_by_date(df, stride):
     # stride일 간격으로 날짜 추출, 해당 날짜의 모든 키워드 유지
     if stride <= 1:
@@ -124,7 +73,7 @@ def _subsample_by_date(df, stride):
     return df[df[DATE_COL].isin(keep_dates)]
 
 
-# ── 데이터 분할 ───────────────────────────────────────────────────────────────
+# 데이터 분할 — 시계열 기반 train/valid/test, gap으로 누수 방지
 def split_data(df: pd.DataFrame, train_stride: int = 1):
     if DATE_COL not in df.columns:
         print("날짜 컬럼 없음 → 랜덤 분할")
@@ -168,7 +117,7 @@ def split_data(df: pd.DataFrame, train_stride: int = 1):
     return train, valid, test
 
 
-# ── Optuna TPE 튜닝 ───────────────────────────────────────────────────────────
+# Optuna TPE 튜닝 — SEARCH_SPACE 기반 하이퍼파라미터 탐색, best params JSON 저장
 def tune_params(
     X_train, y_train,
     X_valid, y_valid,
@@ -220,7 +169,7 @@ def tune_params(
     return {**fixed_params, **best}
 
 
-# ── LightGBM 학습 ─────────────────────────────────────────────────────────────
+# LightGBM 학습 — early stopping 적용, 최적 트리 수 출력
 def train_lgbm(
     X_train, y_train,
     X_valid, y_valid,
@@ -243,7 +192,7 @@ def train_lgbm(
     return model
 
 
-# ── SHAP 분석 ─────────────────────────────────────────────────────────────────
+# SHAP 분석 — feature importance 시각화(bar/beeswarm) 및 CSV 저장
 def shap_analysis(model: lgb.LGBMModel, X: pd.DataFrame, target: str, dirs: dict):
     explainer   = shap.TreeExplainer(model)
     shap_values = explainer.shap_values(X)
@@ -275,7 +224,7 @@ def shap_analysis(model: lgb.LGBMModel, X: pd.DataFrame, target: str, dirs: dict
     imp_df.to_csv(os.path.join(dirs["metrics"], f"shap_importance_{target}.csv"), index=False)
 
 
-# ── 모델 파이프라인 ────────────────────────────────────────────────────────────
+# 모델 파이프라인 — 튜닝 → 학습 → 평가 → SHAP → 모델 저장
 def run_model(
     X_train, y_train,
     X_valid, y_valid,
@@ -316,7 +265,7 @@ def run_model(
     return results
 
 
-# ── 메인 ──────────────────────────────────────────────────────────────────────
+# 메인 — CSV 로드 → 분할 → 타겟별 학습 실행
 def main(csv_path: str, target: str, do_tune: bool, n_trials: int, train_stride: int = 3):
     dirs = _make_run_dir(target)
     print(f"output → {os.path.dirname(dirs['figures'])}")
@@ -387,7 +336,7 @@ def main(csv_path: str, target: str, do_tune: bool, n_trials: int, train_stride:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--data", type=str, default=os.path.join(_ROOT, "data", "processed", "dataset.csv"),
+        "--data", type=str, default=os.path.join(str(ROOT), "data", "processed", "dataset.csv"),
         help="피처 + 라벨 CSV 경로",
     )
     parser.add_argument(

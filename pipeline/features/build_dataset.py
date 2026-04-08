@@ -1,37 +1,17 @@
 import json
+import sys
 import numpy as np
 import pandas as pd
 from pathlib import Path
 
-# ── config ────────────────────────────────────────────────────────────────────
-
-ROOT = Path(__file__).resolve().parent.parent.parent
-RAW = ROOT / "data" / "raw"
-OUT_PATH = ROOT / "data" / "processed" / "dataset.csv"
-
-PATHS = {
-    "search": RAW / "search" / "absolute.csv",
-    "click": RAW / "shopping_click" / "absolute.csv",
-    "mention": RAW / "sometrends" / "sometrend_mention_long.csv",
-}
-
-START = pd.Timestamp("2022-05-01")
-END = pd.Timestamp("2026-02-14")
-LB, FW = 60, 15
-SAMPLE_STRIDE = 1  # 빌드 시 stride=1 (전체), train/valid 서브샘플링은 train.py에서
-EPS = 1e-6
-CLIP = {"level": (0, 30), "growth": (-2, 20), "cv": (0, 10), "ratio": (0, 50)}
-
-W_FULL = [3, 5, 7, 14, 30]          # 내부 계산용 (accel에 growth_3d/5d 필요)
-W_STAT = [7, 14, 30]                 # skew, kurt, cv, rsi (최소 7개 데이터포인트 필요)
-MENTION_COLS = {"블로그": "blog", "인스타그램": "instagram"}
-SIGNALS = ["search", "click", "blog", "instagram"]
-
-
-# ── cache ─────────────────────────────────────────────────────────────────────
-
-CACHE_DIR = ROOT / "data" / "cache"
-CACHE_META = CACHE_DIR / "meta.json"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+from pipeline.config import (
+    ROOT, RAW, OUT_PATH, CACHE_DIR, CACHE_META, PATHS,
+    SIGNALS, SIGNAL_WEIGHTS, MENTION_COLS,
+    W_FULL, W_STAT, W_SHORT,
+    START, END, LB, FW, SAMPLE_STRIDE, EPS, CLIP,
+    FEAT_COLS, LABEL_COLS,
+)
 
 
 
@@ -59,7 +39,7 @@ def _l1_valid(meta):
 
 
 
-# ── loading ───────────────────────────────────────────────────────────────────
+# raw CSV 로드 — search/click은 wide format, mention은 long→pivot
 
 def load_wide(path):
     df = pd.read_csv(path, encoding="utf-8-sig", index_col="keyword")
@@ -81,7 +61,7 @@ def load_all():
     return search, click, mention
 
 
-# ── nan fill ──────────────────────────────────────────────────────────────────
+# 결측 보간 — ffill 후 0으로 채워 float64 배열 반환
 
 def fill_sig(s):
     return s.ffill().fillna(0.0).values.astype(np.float64)
@@ -92,7 +72,7 @@ def _clip(val, kind):
     return float(np.clip(val, lo, hi))
 
 
-# ── RSI ───────────────────────────────────────────────────────────────────────
+# RSI
 
 def _rsi(arr, period=14):
     if len(arr) < period + 1:
@@ -108,23 +88,22 @@ def _rsi(arr, period=14):
     return 100.0 - 100.0 / (1.0 + rs)
 
 
-# ── signal features (73 per signal) ──────────────────────────────────────────
+# 신호별 피처 — lookback 구간에서 통계·추세·파동·모멘텀 산출
 
 def sig_feat(lb, p):
-    # lb: 60-day lookback, p: prefix
+    # lb: lookback 배열, p: 신호 prefix (search/click/blog/instagram)
     baseline = float(np.mean(lb))
     f = {}
 
-    # A. Scale — 절대 규모 (4: 3d 추가)
-    W_SHORT = [3, 7, 14, 30]
+    # 절대 규모 — 윈도우별 평균값
     for n in W_SHORT:
         f[f"{p}_volume_{n}d"] = float(np.mean(lb[-n:]))
 
-    # B. Relative Position (4: 3d 추가)
+    # 상대 위치 — 전체 평균 대비 최근 윈도우 비율
     for n in W_SHORT:
         f[f"{p}_level_{n}d"] = _clip(np.mean(lb[-n:]) / (baseline + EPS), "level")
 
-    # C. Momentum — 성장률 (4 출력, 5 내부 계산)
+    # 성장률 — 최근 n일 vs 이전 n일 평균 비율
     _g = {}
     for n in W_FULL:
         r, pr = lb[-n:], lb[-2 * n : -n]
@@ -132,16 +111,16 @@ def sig_feat(lb, p):
     for n in W_SHORT:
         f[f"{p}_growth_{n}d"] = _g[n]
 
-    # D. Acceleration (3) — 내부 growth 값 사용
+    # 가속도 — 단기/중기/장기 성장률 간 차이
     f[f"{p}_accel_short"] = _g[3] - _g[7]
     f[f"{p}_accel_mid"] = _g[7] - _g[14]
     f[f"{p}_accel_long"] = _g[14] - _g[30]
 
-    # E. RSI (2, 7d 제거 — 7포인트 RSI = 잡음)
+    # RSI
     for n in [14, 30]:
         f[f"{p}_rsi_{n}d"] = _rsi(lb, period=n)
 
-    # F. Shape (skew/kurt 14d/30d + spikiness 3d 추가)
+    # 분포 형태 — skewness, kurtosis, spikiness
     for n in [14, 30]:
         w = lb[-n:]
         s = float(np.std(w))
@@ -156,7 +135,7 @@ def sig_feat(lb, p):
         w = lb[-n:]
         f[f"{p}_spikiness_{n}d"] = float(np.max(w)) / (float(np.mean(w)) + EPS)
 
-    # G. Stability (4)
+    # 안정성 — 변동계수(CV)와 최근 vs 과거 CV 변화
     for n in W_STAT:
         w = lb[-n:]
         f[f"{p}_cv_{n}d"] = _clip(np.std(w) / (np.mean(w) + EPS), "cv")
@@ -164,25 +143,25 @@ def sig_feat(lb, p):
     cv_past = float(np.std(lb[:30])) / (float(np.mean(lb[:30])) + EPS)
     f[f"{p}_cv_change"] = cv_recent - cv_past
 
-    # H. Lag (5)
+    # 시차 — n일 전 값의 baseline 대비 비율
     for n in [1, 3, 7, 14, 30]:
         f[f"{p}_lag_{n}d"] = float(lb[-n]) / (baseline + EPS)
 
-    # I. Std (3)
+    # 표준편차 — 윈도우별 분산 크기
     for n in W_STAT:
         f[f"{p}_std_{n}d"] = float(np.std(lb[-n:]))
 
-    # J. Position (5)
+    # 위치 — 최근 값이 윈도우 내 최고점 대비 어디에 있는지
     smooth = float(np.mean(lb[-3:]))
     for n in W_FULL:
         f[f"{p}_pos_{n}d"] = smooth / (float(np.max(lb[-n:])) + EPS)
 
-    # K. Peak Recency (1)
+    # 피크 최근성 — 최근 고점으로부터 경과 일수
     f[f"days_since_{p}_max_14d"] = 13 - int(np.argmax(lb[-14:]))
 
-    # ── 신규 동적 피처 ──
+    # 신규 동적 피처
 
-    # L. Micro-Trend — 기울기, 곡률, 추세 품질 (8)
+    # 추세 — 다항식 기울기, 곡률, 추세 설명력(R²)
     slope_3d = float(np.polyfit(np.arange(3), lb[-3:], 1)[0])
     slope_7d = float(np.polyfit(np.arange(7), lb[-7:], 1)[0])
     slope_14d = float(np.polyfit(np.arange(14), lb[-14:], 1)[0])
@@ -202,7 +181,7 @@ def sig_feat(lb, p):
     f[f"{p}_residual_energy_7d"] = 1.0 - r2
     f[f"{p}_curvature_14d"] = float(np.polyfit(np.arange(14), lb[-14:], 2)[0])
 
-    # M. Wave Dynamics — 진동, 감쇠, 방향 전환 (6)
+    # 파동 — 변동성 비율, 진폭 감쇠, 방향 전환 빈도
     std_30 = float(np.std(lb[-30:]))
     f[f"{p}_vol_ratio"] = std_7 / (std_30 + EPS)
 
@@ -233,7 +212,7 @@ def sig_feat(lb, p):
     d3 = np.diff(lb[-4:])
     f[f"{p}_reversal_3d"] = int(d3[-1] * d3[-2] < 0) if len(d3) >= 2 else 0
 
-    # N. Regime/Breakout — 볼린저 밴드, 돌파 강도 (5)
+    # 레짐·돌파 — 볼린저 밴드 내 위치, 밴드 폭, 돌파 강도
     mu_30 = float(np.mean(lb[-30:]))
     upper = mu_30 + 2 * std_30
     lower = mu_30 - 2 * std_30
@@ -245,7 +224,7 @@ def sig_feat(lb, p):
     bp_3d_ago = (float(lb[-4]) - lower) / (band_range + EPS)
     f[f"{p}_band_approach"] = f[f"{p}_band_position"] - bp_3d_ago
 
-    # O. Daily Momentum — 일별 변화율, 다이버전스 (4)
+    # 일별 모멘텀 — 전일 대비 수익률, RSI-기울기 다이버전스
     prev_val = float(lb[-2])
     f[f"{p}_daily_return_1d"] = float(np.clip((float(lb[-1]) - prev_val) / (prev_val + EPS), -10, 100))
 
@@ -259,7 +238,7 @@ def sig_feat(lb, p):
     daily_accel_arr = np.diff(lb[-3:])
     f[f"{p}_daily_accel_1d"] = float(daily_accel_arr[-1] - daily_accel_arr[0]) if len(daily_accel_arr) >= 2 else 0.0
 
-    # P. Daily Change — 최근 7일 개별 변화율 (7)
+    # 일별 변화율 — 최근 7일간 개별 일차 변화율
     for d in range(1, 8):
         change = (float(lb[-d]) - float(lb[-(d + 1)])) / (abs(float(lb[-(d + 1)])) + EPS)
         f[f"{p}_change_{d}d_ago"] = float(np.clip(change, -10, 100))
@@ -267,7 +246,7 @@ def sig_feat(lb, p):
     return f
 
 
-# ── cross-correlation helpers ────────────────────────────────────────────────
+# 교차상관 보조함수 — 최적 시차와 방향 동조율 산출
 
 def _xcorr_lag(a_lb, b_lb, max_lag=7):
     # a가 b를 선행하는 최적 시차와 상관도
@@ -296,13 +275,13 @@ def _dir_agree(a_lb, b_lb, window=7):
     return float(np.mean(a_dir == b_dir))
 
 
-# ── cross features (39 = 8 ratio/lead + 12 xcorr/slope + 19 multi-channel) ──
+# 교차 피처 — 채널 간 비율, 선행/후행, 교차상관, 멀티채널 종합
 
 def cross_feat(sf, cf, pfs, all_lbs):
     f = {}
     s7 = sf["search_level_7d"]
 
-    # 기존 8개 — ratio, lead, pos gap
+    # ratio, lead, pos gap
     f["click_search_ratio"] = _clip(cf["click_level_7d"] / (s7 + EPS), "ratio")
     f["click_lead_7d"] = cf["click_growth_7d"] - sf["search_growth_7d"]
     f["click_lead_14d"] = cf["click_growth_14d"] - sf["search_growth_14d"]
@@ -342,7 +321,7 @@ def cross_feat(sf, cf, pfs, all_lbs):
     )
 
     # weighted_slope_strength — 기울기 크기까지 반영한 가중 모멘텀 강도
-    weights = {"search": 0.4, "click": 0.3, "blog": 0.2, "instagram": 0.1}
+    weights = SIGNAL_WEIGHTS
     wss = 0.0
     for sig, w in weights.items():
         lb = all_lbs.get(sig, np.zeros(1))
@@ -366,7 +345,7 @@ def cross_feat(sf, cf, pfs, all_lbs):
             first_days.append(14)
     f["activation_spread"] = max(first_days) - min(first_days)
 
-    # ── 멀티채널 종합 피처 (3종×5윈도우 + accel×4윈도우(n≥3) + conv_trend = 20개) ──
+    # 멀티채널 종합 피처
     W_MULTI = [1, 3, 7, 14, 30]
 
     for n in W_MULTI:
@@ -414,13 +393,12 @@ def cross_feat(sf, cf, pfs, all_lbs):
     return f
 
 
-# ── labels ────────────────────────────────────────────────────────────────────
+# 라벨 생성 — forward window에서 intensity/buzz/growth/sustainability/crash 산출
 
 def compute_labels(s_fw, c_fw, b_fw, i_fw, s_lb, c_lb, b_lb, i_lb, kw_stats=None):
-    # 5종 × 3윈도우 = 15 라벨
     sigs_fw = {"search": s_fw, "click": c_fw, "blog": b_fw, "instagram": i_fw}
     sigs_lb = {"search": s_lb, "click": c_lb, "blog": b_lb, "instagram": i_lb}
-    weights = {"search": 0.4, "click": 0.3, "blog": 0.2, "instagram": 0.1}
+    weights = SIGNAL_WEIGHTS
     combined = s_fw + c_fw + b_fw + i_fw
 
     labels = {}
@@ -440,7 +418,7 @@ def compute_labels(s_fw, c_fw, b_fw, i_fw, s_lb, c_lb, b_lb, i_lb, kw_stats=None
             comp += wt * float(np.clip(z, -10, 10))
         labels[f"buzz_composite_{w}d"] = round(comp, 6)
 
-        # growth — 과거 대비 4채널 가중 성장비 (ratio, 항상 양수. 1=변화없음, 2=2배)
+        # growth — 과거 대비 가중 성장비 (ratio, 항상 양수)
         gr = 0.0
         for sig, wt in weights.items():
             past = float(np.mean(sigs_lb[sig][-w:]))
@@ -456,102 +434,14 @@ def compute_labels(s_fw, c_fw, b_fw, i_fw, s_lb, c_lb, b_lb, i_lb, kw_stats=None
         sust = float(np.mean(fw_w)) / (floor + EPS)
         labels[f"sustainability_{w}d"] = round(float(np.clip(sust, 0, 5)), 6)
 
-        # crash — 현재에서 최저점까지 하락률 (0=안빠짐, 양수=빠짐)
+        # crash — 현재에서 최저점까지 하락률
         cr = (current - float(np.min(fw_w))) / (current + EPS) if current > EPS else 0.0
         labels[f"crash_{w}d"] = round(float(np.clip(cr, 0, 10)), 6)
 
     return labels
 
 
-# ── column order ──────────────────────────────────────────────────────────────
-
-W_SHORT = [3, 7, 14, 30]
-
-def _sig_cols(p):
-    c = []
-    for n in W_SHORT:   c.append(f"{p}_volume_{n}d")          # 4
-    for n in W_SHORT:   c.append(f"{p}_level_{n}d")           # 4
-    for n in W_SHORT:   c.append(f"{p}_growth_{n}d")          # 4
-    c += [f"{p}_accel_short", f"{p}_accel_mid", f"{p}_accel_long"]  # 3
-    for n in [14, 30]:  c.append(f"{p}_rsi_{n}d")             # 2
-    for n in [14, 30]:  c.append(f"{p}_skew_{n}d")            # 2
-    for n in [14, 30]:  c.append(f"{p}_kurt_{n}d")            # 2
-    for n in W_SHORT:   c.append(f"{p}_spikiness_{n}d")       # 4
-    for n in W_STAT:    c.append(f"{p}_cv_{n}d")              # 3
-    c.append(f"{p}_cv_change")                                 # 1
-    for n in [1, 3, 7, 14, 30]: c.append(f"{p}_lag_{n}d")    # 5
-    for n in W_STAT:    c.append(f"{p}_std_{n}d")             # 3
-    for n in W_FULL:    c.append(f"{p}_pos_{n}d")             # 5
-    c.append(f"days_since_{p}_max_14d")                        # 1
-    # L. Micro-Trend (8)
-    c += [f"{p}_slope_3d", f"{p}_slope_7d", f"{p}_slope_14d"]
-    c += [f"{p}_norm_slope_7d", f"{p}_slope_change"]
-    c += [f"{p}_trend_r2_7d", f"{p}_residual_energy_7d", f"{p}_curvature_14d"]
-    # M. Wave Dynamics (6)
-    c += [f"{p}_vol_ratio", f"{p}_range_squeeze", f"{p}_damping"]
-    c += [f"{p}_zero_crossings_14d", f"{p}_direction_streak", f"{p}_reversal_3d"]
-    # N. Regime/Breakout (5)
-    c += [f"{p}_band_position", f"{p}_band_width", f"{p}_drawdown_14d", f"{p}_breakout_strength"]
-    c.append(f"{p}_band_approach")
-    # O. Daily Momentum (4)
-    c += [f"{p}_daily_return_1d", f"{p}_daily_returns_3d_avg"]
-    c += [f"{p}_momentum_divergence", f"{p}_daily_accel_1d"]
-    # P. Daily Change (7)
-    for d in range(1, 8):
-        c.append(f"{p}_change_{d}d_ago")
-    return c  # 73개
-
-
-FEAT_COLS = []
-for _p in SIGNALS:
-    FEAT_COLS += _sig_cols(_p)
-
-# cross (old 8)
-FEAT_COLS += [
-    "click_search_ratio", "click_lead_7d", "click_lead_14d", "click_search_pos_gap",
-    "blog_lead_7d", "blog_search_ratio",
-    "instagram_lead_7d", "instagram_search_ratio",
-]
-# cross (new 12) — 교차상관 시차, 방향 동조, 기울기 괴리
-FEAT_COLS += [
-    "blog_search_best_lag", "blog_search_peak_xcorr",
-    "insta_search_best_lag", "insta_search_peak_xcorr",
-    "click_search_best_lag", "click_search_peak_xcorr",
-    "blog_search_dir_agree", "insta_search_dir_agree", "click_search_dir_agree",
-    "blog_search_slope_gap", "insta_search_slope_gap",
-    "multi_slope_count",
-    "blog_search_lead_magnitude", "insta_search_lead_magnitude", "click_search_lead_magnitude",
-    "weighted_slope_strength", "activation_spread",
-]
-# surge (10: intensity×2 + accel×2 + lead_days per platform)
-FEAT_COLS += [
-    "blog_surge_intensity_3d", "blog_surge_intensity_7d",
-    "blog_surge_accel_3d", "blog_surge_accel_7d", "blog_surge_lead_days",
-    "instagram_surge_intensity_3d", "instagram_surge_intensity_7d",
-    "instagram_surge_accel_3d", "instagram_surge_accel_7d", "instagram_surge_lead_days",
-]
-# 멀티채널 종합 (19: conversion_rate×5 + channel_active×5 + accel×4 + buzz_zscore×5)
-_W_MULTI = [1, 3, 7, 14, 30]
-for _n in _W_MULTI:
-    FEAT_COLS += [f"past_conversion_rate_{_n}d", f"past_channel_active_{_n}d"]
-    if _n >= 3:
-        FEAT_COLS.append(f"multi_accel_{_n}d")
-    FEAT_COLS.append(f"past_buzz_zscore_{_n}d")
-FEAT_COLS += ["conv_trend"]
-# calendar
-FEAT_COLS += ["month"]
-
-LABEL_COLS = [
-    "intensity_5d", "intensity_10d", "intensity_15d",
-    "buzz_composite_5d", "buzz_composite_10d", "buzz_composite_15d",
-    "growth_5d", "growth_10d", "growth_15d",
-    "sustainability_5d", "sustainability_10d", "sustainability_15d",
-    "crash_5d", "crash_10d", "crash_15d",
-]
-assert len(FEAT_COLS) == 348, f"expected 348, got {len(FEAT_COLS)}"
-
-
-# ── main ──────────────────────────────────────────────────────────────────────
+# 키워드별 처리 + 데이터셋 빌드
 
 def _process_keyword(args):
     kw, s_arr, c_arr, plats, pred_idx, dates, s_inv, stride, cached_sf = args
@@ -628,7 +518,7 @@ def _process_keyword(args):
 
 
 def _build_signals(search, click, mention, kws, dates):
-    """L1: 키워드별 전처리된 시그널 배열 생성 또는 캐시 로드"""
+    # 키워드별 전처리 시그널 배열 생성 또는 캐시 로드
     import h5py
     meta = _load_meta()
     h5_path = CACHE_DIR / "signals.h5"
