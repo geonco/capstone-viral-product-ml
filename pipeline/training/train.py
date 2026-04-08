@@ -174,7 +174,7 @@ def tune_params(
             X_train, y_train,
             eval_set=[(X_valid, y_valid)],
             callbacks=[
-                lgb.early_stopping(stopping_rounds=50, verbose=False),
+                lgb.early_stopping(stopping_rounds=30, verbose=False),
                 lgb.log_evaluation(period=-1),
             ],
         )
@@ -213,7 +213,7 @@ def train_lgbm(
         X_train, y_train,
         eval_set=[(X_valid, y_valid)],
         callbacks=[
-            lgb.early_stopping(stopping_rounds=50, verbose=False),
+            lgb.early_stopping(stopping_rounds=30, verbose=False),
             lgb.log_evaluation(period=200),
         ],
     )
@@ -300,7 +300,7 @@ def run_model(
 
 
 # ── 메인 ──────────────────────────────────────────────────────────────────────
-def main(csv_path: str, use_splits: bool, do_tune: bool, n_trials: int, user: str | None = None):
+def main(csv_path: str, use_splits: bool, do_tune: bool, n_trials: int, user: str | None = None, targets: list[str] | None = None):
     # 실험 폴더 설정
     experiment_name = get_experiment_dir(user)
     dir_figures, dir_metrics, dir_models = setup_experiment_dirs(experiment_name)
@@ -312,10 +312,10 @@ def main(csv_path: str, use_splits: bool, do_tune: bool, n_trials: int, user: st
 
     # 1. 데이터 로드 (컬럼 검증 및 재정렬 포함)
     if use_splits:
-        print("분할된 데이터 사용: data/processed/splits/")
-        train_df = load_csv("data/processed/splits/train.csv")
-        valid_df = load_csv("data/processed/splits/valid.csv")
-        test_df  = load_csv("data/processed/splits/test.csv")
+        print("분할된 데이터 사용: data_processed/splits/")
+        train_df = load_csv("data_processed/splits/train.csv")
+        valid_df = load_csv("data_processed/splits/valid.csv")
+        test_df  = load_csv("data_processed/splits/test.csv")
         print(f"train={len(train_df)}  valid={len(valid_df)}  test={len(test_df)}")
     else:
         df = load_csv(csv_path)
@@ -331,33 +331,28 @@ def main(csv_path: str, use_splits: bool, do_tune: bool, n_trials: int, user: st
     X_valid = valid_df[FEATURE_COLS]
     X_test  = test_df[FEATURE_COLS]
 
-    # 3. virality_score 모델
-    results = run_model(
-        X_train, train_df[TARGET_VIRALITY],
-        X_valid, valid_df[TARGET_VIRALITY],
-        X_test,  test_df[TARGET_VIRALITY],
-        target     = TARGET_VIRALITY,
-        base_params= {**DEFAULT_PARAMS},
-        do_tune    = do_tune,
-        n_trials   = n_trials,
-        dir_figures= dir_figures,
-        dir_metrics= dir_metrics,
-        dir_models = dir_models,
-    )
+    if targets is None:
+        targets = [TARGET_VIRALITY, TARGET_TIMING]
 
-    # 4. peak_timing 모델 (MAE 직접 최적화)
-    results += run_model(
-        X_train, train_df[TARGET_TIMING],
-        X_valid, valid_df[TARGET_TIMING],
-        X_test,  test_df[TARGET_TIMING],
-        target     = TARGET_TIMING,
-        base_params= {**DEFAULT_PARAMS, "objective": "regression_l1"},
-        do_tune    = do_tune,
-        n_trials   = n_trials,
-        dir_figures= dir_figures,
-        dir_metrics= dir_metrics,
-        dir_models = dir_models,
-    )
+    target_configs = {
+        TARGET_VIRALITY: {**DEFAULT_PARAMS},
+        TARGET_TIMING:   {**DEFAULT_PARAMS, "objective": "regression_l1"},
+    }
+
+    results = []
+    for target in targets:
+        results += run_model(
+            X_train, train_df[target],
+            X_valid, valid_df[target],
+            X_test,  test_df[target],
+            target     = target,
+            base_params= target_configs[target],
+            do_tune    = do_tune,
+            n_trials   = n_trials,
+            dir_figures= dir_figures,
+            dir_metrics= dir_metrics,
+            dir_models = dir_models,
+        )
 
     # 5. 결과 저장
     res_df = pd.DataFrame(results)
@@ -431,5 +426,11 @@ if __name__ == "__main__":
         "--user", type=str, default=None,
         help="실험자 이름 (최초 1회 지정하면 outputs/.username에 저장됨)",
     )
+    parser.add_argument(
+        "--targets", type=str, nargs="+",
+        choices=[TARGET_VIRALITY, TARGET_TIMING],
+        default=[TARGET_VIRALITY, TARGET_TIMING],
+        help="학습할 타깃 목록 (기본값: 둘 다). 예: --targets peak_time",
+    )
     args = parser.parse_args()
-    main(args.data, args.use_splits, args.tune, args.n_trials, args.user)
+    main(args.data, args.use_splits, args.tune, args.n_trials, args.user, args.targets)
