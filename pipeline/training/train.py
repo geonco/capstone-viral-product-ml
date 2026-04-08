@@ -1,6 +1,7 @@
 # LightGBM 바이럴 예측 모델 (Optuna TPE 하이퍼파라미터 튜닝 포함)
-# 6개 타겟: future_intensity, future_acceleration, peak_timing,
-#           signal_agreement, trajectory_class, search_click_convergence
+# 7개 타겟: future_intensity, future_acceleration, peak_timing,
+#           signal_agreement, search_click_convergence,
+#           buzz_composite, momentum_score
 
 import argparse
 import json
@@ -34,19 +35,15 @@ TRAIN_RATIO = 0.70
 VALID_RATIO = 0.15
 GAP_DAYS = 74  # LB(60) + FW(14), train↔valid↔test 간 누수 방지
 
-CLASSIFICATION_TARGETS = {"channel_breadth"}
+CLASSIFICATION_TARGETS = set()
 TARGET_CONFIG = {
-    # v1
     "future_intensity":        {"log": True},
     "future_acceleration":     {"log": False},
+    "peak_timing":             {"log": False},
     "signal_agreement":        {"log": False},
     "search_click_convergence":{"log": False},
-    # v2
     "buzz_composite":     {"log": False},
-    "buzz_rank":          {"log": False},
     "momentum_score":     {"log": False},
-    "channel_breadth":    {"log": False, "num_class": 5},
-    "conversion_shift":   {"log": False},
 }
 
 DEFAULT_PARAMS = {
@@ -424,8 +421,8 @@ if __name__ == "__main__":
         help="271피처 + 라벨 CSV 경로 (미지정 시 data/processed/ 내 최신 파일)",
     )
     parser.add_argument(
-        "--target", type=str, default="buzz_rank",
-        help="학습 타겟 (v1: future_intensity, future_acceleration, signal_agreement, search_click_convergence / v2: buzz_rank, momentum_score, channel_breadth, conversion_shift / all)",
+        "--target", type=str, default="future_intensity",
+        help="학습 타겟 (future_intensity, future_acceleration, peak_timing, signal_agreement, search_click_convergence, buzz_composite, momentum_score, all)",
     )
     parser.add_argument(
         "--tune", action="store_true",
@@ -459,12 +456,9 @@ if __name__ == "__main__":
         print(f"auto-selected: {csv_path}")
 
     ALL_TARGETS = [
-        # v1
-        "future_intensity", "future_acceleration",
+        "future_intensity", "future_acceleration", "peak_timing",
         "signal_agreement", "search_click_convergence",
-        # v2
-        "buzz_rank", "momentum_score",
-        "channel_breadth", "conversion_shift",
+        "buzz_composite", "momentum_score",
     ]
     targets = ALL_TARGETS if args.target == "all" else [args.target]
     for t in targets:

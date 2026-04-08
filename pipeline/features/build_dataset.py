@@ -1,3 +1,6 @@
+import hashlib
+import inspect
+import json
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -29,6 +32,48 @@ W_OUT = [7, 14, 30]                  # 출력 윈도우 (3d/5d 제거 — SHAP �
 W_STAT = [7, 14, 30]                 # skew, kurt, cv, rsi (최소 7개 데이터포인트 필요)
 MENTION_COLS = {"블로그": "blog", "인스타그램": "instagram"}
 SIGNALS = ["search", "click", "blog", "instagram"]
+
+
+# ── cache ─────────────────────────────────────────────────────────────────────
+
+CACHE_DIR = ROOT / "data" / "cache"
+CACHE_META = CACHE_DIR / "meta.json"
+
+
+def _sig_feat_hash():
+    src = inspect.getsource(sig_feat)
+    return hashlib.md5(src.encode()).hexdigest()
+
+
+def _raw_mtime():
+    return max(p.stat().st_mtime for p in PATHS.values() if p.exists())
+
+
+def _load_meta():
+    if CACHE_META.exists():
+        return json.loads(CACHE_META.read_text())
+    return {}
+
+
+def _save_meta(meta):
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    CACHE_META.write_text(json.dumps(meta, indent=2))
+
+
+def _l1_valid(meta):
+    return (
+        meta.get("l1_raw_mtime")
+        and (CACHE_DIR / "signals.h5").exists()
+        and meta["l1_raw_mtime"] >= _raw_mtime()
+    )
+
+
+def _l2_valid(meta):
+    return (
+        meta.get("l2_sig_feat_hash")
+        and (CACHE_DIR / "sig_feat.parquet").exists()
+        and meta["l2_sig_feat_hash"] == _sig_feat_hash()
+    )
 
 
 # ── loading ───────────────────────────────────────────────────────────────────
@@ -80,27 +125,28 @@ def _rsi(arr, period=14):
     return 100.0 - 100.0 / (1.0 + rs)
 
 
-# ── signal features (61 per signal) ──────────────────────────────────────────
+# ── signal features (65 per signal) ──────────────────────────────────────────
 
 def sig_feat(lb, p):
     # lb: 60-day lookback, p: prefix
     baseline = float(np.mean(lb))
     f = {}
 
-    # A. Scale — 절대 규모 (3, 3d/5d 제거)
-    for n in W_OUT:
+    # A. Scale — 절대 규모 (4: 3d 추가)
+    W_SHORT = [3, 7, 14, 30]
+    for n in W_SHORT:
         f[f"{p}_volume_{n}d"] = float(np.mean(lb[-n:]))
 
-    # B. Relative Position (3)
-    for n in W_OUT:
+    # B. Relative Position (4: 3d 추가)
+    for n in W_SHORT:
         f[f"{p}_level_{n}d"] = _clip(np.mean(lb[-n:]) / (baseline + EPS), "level")
 
-    # C. Momentum — 성장률 (3 출력, 5 내부 계산)
+    # C. Momentum — 성장률 (4 출력, 5 내부 계산)
     _g = {}
     for n in W_FULL:
         r, pr = lb[-n:], lb[-2 * n : -n]
         _g[n] = _clip(np.mean(r) / (np.mean(pr) + EPS) - 1, "growth")
-    for n in W_OUT:
+    for n in W_SHORT:
         f[f"{p}_growth_{n}d"] = _g[n]
 
     # D. Acceleration (3) — 내부 growth 값 사용
@@ -112,7 +158,7 @@ def sig_feat(lb, p):
     for n in [14, 30]:
         f[f"{p}_rsi_{n}d"] = _rsi(lb, period=n)
 
-    # F. Shape (7, skew/kurt 7d 제거, spikiness 3d/5d 제거)
+    # F. Shape (skew/kurt 14d/30d + spikiness 3d 추가)
     for n in [14, 30]:
         w = lb[-n:]
         s = float(np.std(w))
@@ -123,7 +169,7 @@ def sig_feat(lb, p):
         else:
             f[f"{p}_skew_{n}d"] = 0.0
             f[f"{p}_kurt_{n}d"] = 0.0
-    for n in W_OUT:
+    for n in W_SHORT:
         w = lb[-n:]
         f[f"{p}_spikiness_{n}d"] = float(np.max(w)) / (float(np.mean(w)) + EPS)
 
@@ -297,13 +343,56 @@ def cross_feat(sf, cf, pfs, all_lbs):
         and float(np.polyfit(np.arange(7), all_lbs[sig][-7:], 1)[0]) > 0
     )
 
+    # ── 멀티채널 종합 피처 (4종 × 5윈도우 = 19개) ──
+    weights = {"search": 0.4, "click": 0.3, "blog": 0.2, "instagram": 0.1}
+    W_MULTI = [1, 3, 7, 14, 30]
+
+    for n in W_MULTI:
+        # past_conversion_rate — 과거 n일 구매 전환율
+        awareness = sum(float(np.mean(all_lbs.get(s, np.zeros(1))[-n:])) for s in ["search", "blog", "instagram"])
+        action = float(np.mean(all_lbs.get("click", np.zeros(1))[-n:]))
+        f[f"past_conversion_rate_{n}d"] = action / (awareness + EPS) if awareness > EPS else 0.0
+
+        # past_channel_active — 과거 n일 기준 활성 채널 수
+        f[f"past_channel_active_{n}d"] = sum(
+            1 for sig in ["search", "click", "blog", "instagram"]
+            if all_lbs.get(sig, np.zeros(1)).shape[0] >= n
+            and float(np.mean(all_lbs[sig][-n:])) > float(np.median(all_lbs[sig])) + EPS
+            and float(np.median(all_lbs[sig])) > EPS
+        )
+
+        # multi_accel — 4채널 가중 가속도 (최근 n일 vs 이전 n일, n>=3만)
+        if n >= 3:
+            accel_sum = 0.0
+            for sig, w in weights.items():
+                lb = all_lbs.get(sig, np.zeros(1))
+                if len(lb) >= 2 * n:
+                    prev = float(np.mean(lb[-2 * n:-n]))
+                    recent = float(np.mean(lb[-n:]))
+                    denom = max(prev, recent)
+                    if denom > EPS:
+                        accel_sum += w * (recent - prev) / (denom + EPS)
+            f[f"multi_accel_{n}d"] = float(np.clip(accel_sum, -1, 1))
+
+        # past_buzz_zscore — 최근 n일 4채널 가중 z-score
+        zscore_sum = 0.0
+        for sig, w in weights.items():
+            lb = all_lbs.get(sig, np.zeros(1))
+            if len(lb) >= n:
+                mu = float(np.mean(lb))
+                sigma = float(np.std(lb))
+                recent = float(np.mean(lb[-n:]))
+                z = (recent - mu) / (sigma + EPS) if sigma > EPS else 0.0
+                zscore_sum += w * z
+        f[f"past_buzz_zscore_{n}d"] = zscore_sum
+
     return f
 
 
 # ── labels ────────────────────────────────────────────────────────────────────
 
 def compute_labels(s_fw, c_fw, b_fw, i_fw, s_lb, c_lb, b_lb, i_lb, kw_stats=None):
-    # A. buzz_composite — 4채널 z-score 가중 합산 (buzz_rank는 main에서 후처리)
+    # A. buzz_composite — 4채널 z-score 가중 합산
     sigs_fw = {"search": s_fw, "click": c_fw, "blog": b_fw, "instagram": i_fw}
     sigs_lb = {"search": s_lb, "click": c_lb, "blog": b_lb, "instagram": i_lb}
     weights = {"search": 0.4, "click": 0.3, "blog": 0.2, "instagram": 0.1}
@@ -329,31 +418,13 @@ def compute_labels(s_fw, c_fw, b_fw, i_fw, s_lb, c_lb, b_lb, i_lb, kw_stats=None
     momentum = accel_sum / (w_sum + EPS) if w_sum > 0 else 0.0
     momentum = float(np.clip(momentum, -1, 1))
 
-    # C. channel_breadth — 활성 채널 수 (0~4)
-    breadth = 0
-    for sig in ["search", "click", "blog", "instagram"]:
-        baseline = float(np.median(sigs_lb[sig]))
-        if float(np.mean(sigs_fw[sig])) > baseline and baseline > EPS:
-            breadth += 1
-
-    # D. conversion_shift — 구매 전환율 변화 (z-score)
-    awareness_fw = float(np.mean(s_fw)) + float(np.mean(b_fw)) + float(np.mean(i_fw))
-    action_fw = float(np.mean(c_fw))
-    ratio_fw = action_fw / (awareness_fw + EPS) if awareness_fw > EPS else 0.0
-
-    awareness_lb = float(np.mean(s_lb)) + float(np.mean(b_lb)) + float(np.mean(i_lb))
-    action_lb = float(np.mean(c_lb))
-    ratio_lb = action_lb / (awareness_lb + EPS) if awareness_lb > EPS else 0.0
-
-    # lookback 내 ratio의 변동으로 z-score 근사
-    ratio_diff = ratio_fw - ratio_lb
-    conv_shift = ratio_diff / (abs(ratio_lb) + EPS) if abs(ratio_lb) > EPS else 0.0
-    conv_shift = float(np.clip(conv_shift, -5, 5))
-
-    # ── 기존 라벨 (v1) ──
+    # ── 순수 미래 라벨 ──
 
     # future_intensity — 4채널 합산 버즈 볼륨
     intensity = float(np.mean(s_fw) + np.mean(c_fw) + np.mean(b_fw) + np.mean(i_fw))
+
+    # peak_timing — 4채널 합산 피크 시점 (0=즉시, 1=후반)
+    peak_timing = int(np.argmax(s_fw + c_fw + b_fw + i_fw)) / (FW - 1)
 
     # future_acceleration — 검색 week2/week1 성장률
     fa_w1 = float(np.mean(s_fw[:7]))
@@ -387,16 +458,15 @@ def compute_labels(s_fw, c_fw, b_fw, i_fw, s_lb, c_lb, b_lb, i_lb, kw_stats=None
         conv = 0.0
 
     return {
-        # v1 라벨
+        # 순수 미래
         "future_intensity": round(intensity, 6),
         "future_acceleration": round(fa_accel, 6),
+        "peak_timing": round(peak_timing, 6),
         "signal_agreement": round(agreement, 6),
         "search_click_convergence": round(conv, 6),
-        # v2 라벨
+        # 과거+미래 혼합
         "buzz_composite": round(composite, 6),
         "momentum_score": round(momentum, 6),
-        "channel_breadth": breadth,
-        "conversion_shift": round(conv_shift, 6),
     }
 
 
@@ -430,22 +500,23 @@ def compute(s, c, plats, t, s_inv):
     all_lbs.update(plat_lbs)
     row.update(cross_feat(sf, cf, pfs, all_lbs))
 
-    # surge — blog/instagram 선행 신호, 연속값 (6개)
+    # surge — blog/instagram 선행 신호, 연속값 (3d/7d × 2종 + lead_days = 10개)
     for pp in ["blog", "instagram"]:
         p_lb = plat_lbs.get(pp, np.zeros(LB, dtype=np.float64))
         p_base = float(np.mean(p_lb[:30]))
 
-        # surge_intensity: 최근 7일 최대값 / baseline - 1
-        if p_base > EPS:
-            row[f"{pp}_surge_intensity"] = float(np.clip(np.max(p_lb[-7:]) / p_base - 1, 0, 50))
-        else:
-            row[f"{pp}_surge_intensity"] = 0.0
+        for sn in [3, 7]:
+            # surge_intensity: 최근 n일 최대값 / baseline - 1
+            if p_base > EPS:
+                row[f"{pp}_surge_intensity_{sn}d"] = float(np.clip(np.max(p_lb[-sn:]) / p_base - 1, 0, 50))
+            else:
+                row[f"{pp}_surge_intensity_{sn}d"] = 0.0
 
-        # surge_accel: 최근 7일 기울기 / baseline
-        if p_base > EPS:
-            row[f"{pp}_surge_accel"] = float(np.polyfit(np.arange(7), p_lb[-7:], 1)[0]) / p_base
-        else:
-            row[f"{pp}_surge_accel"] = 0.0
+            # surge_accel: 최근 n일 기울기 / baseline
+            if p_base > EPS:
+                row[f"{pp}_surge_accel_{sn}d"] = float(np.polyfit(np.arange(sn), p_lb[-sn:], 1)[0]) / p_base
+            else:
+                row[f"{pp}_surge_accel_{sn}d"] = 0.0
 
         # surge_lead_days: platform peak - search peak in last 14d (양수 = platform 선행)
         p_peak = int(np.argmax(p_lb[-14:]))
@@ -466,17 +537,18 @@ def compute(s, c, plats, t, s_inv):
 
 # ── column order ──────────────────────────────────────────────────────────────
 
+W_SHORT = [3, 7, 14, 30]
+
 def _sig_cols(p):
     c = []
-    # A~K: 기존 유지 (3d/5d 제거, rsi_7d/skew_7d/kurt_7d/spikiness_3d,5d 제거)
-    for n in W_OUT:     c.append(f"{p}_volume_{n}d")          # 3
-    for n in W_OUT:     c.append(f"{p}_level_{n}d")           # 3
-    for n in W_OUT:     c.append(f"{p}_growth_{n}d")          # 3
+    for n in W_SHORT:   c.append(f"{p}_volume_{n}d")          # 4
+    for n in W_SHORT:   c.append(f"{p}_level_{n}d")           # 4
+    for n in W_SHORT:   c.append(f"{p}_growth_{n}d")          # 4
     c += [f"{p}_accel_short", f"{p}_accel_mid", f"{p}_accel_long"]  # 3
     for n in [14, 30]:  c.append(f"{p}_rsi_{n}d")             # 2
     for n in [14, 30]:  c.append(f"{p}_skew_{n}d")            # 2
     for n in [14, 30]:  c.append(f"{p}_kurt_{n}d")            # 2
-    for n in W_OUT:     c.append(f"{p}_spikiness_{n}d")       # 3
+    for n in W_SHORT:   c.append(f"{p}_spikiness_{n}d")       # 4
     for n in W_STAT:    c.append(f"{p}_cv_{n}d")              # 3
     c.append(f"{p}_cv_change")                                 # 1
     for n in [1, 3, 7, 14, 30]: c.append(f"{p}_lag_{n}d")    # 5
@@ -495,7 +567,7 @@ def _sig_cols(p):
     # O. Daily Momentum (4)
     c += [f"{p}_daily_return_1d", f"{p}_daily_returns_3d_avg"]
     c += [f"{p}_momentum_divergence", f"{p}_daily_accel_1d"]
-    return c  # 61개
+    return c  # 65개
 
 
 FEAT_COLS = []
@@ -517,41 +589,228 @@ FEAT_COLS += [
     "blog_search_slope_gap", "insta_search_slope_gap",
     "multi_slope_count",
 ]
-# surge (new 6) — 연속값
+# surge (10: intensity×2 + accel×2 + lead_days per platform)
 FEAT_COLS += [
-    "blog_surge_intensity", "blog_surge_accel", "blog_surge_lead_days",
-    "instagram_surge_intensity", "instagram_surge_accel", "instagram_surge_lead_days",
+    "blog_surge_intensity_3d", "blog_surge_intensity_7d",
+    "blog_surge_accel_3d", "blog_surge_accel_7d", "blog_surge_lead_days",
+    "instagram_surge_intensity_3d", "instagram_surge_intensity_7d",
+    "instagram_surge_accel_3d", "instagram_surge_accel_7d", "instagram_surge_lead_days",
 ]
+# 멀티채널 종합 (19: conversion_rate×5 + channel_active×5 + accel×4 + buzz_zscore×5)
+_W_MULTI = [1, 3, 7, 14, 30]
+for _n in _W_MULTI:
+    FEAT_COLS += [f"past_conversion_rate_{_n}d", f"past_channel_active_{_n}d"]
+    if _n >= 3:
+        FEAT_COLS.append(f"multi_accel_{_n}d")
+    FEAT_COLS.append(f"past_buzz_zscore_{_n}d")
 # calendar (day_of_week 제거)
 FEAT_COLS += ["month"]
 
 LABEL_COLS = [
-    # v1
-    "future_intensity", "future_acceleration",
+    "future_intensity", "future_acceleration", "peak_timing",
     "signal_agreement", "search_click_convergence",
-    # v2
     "buzz_composite", "momentum_score",
-    "channel_breadth", "conversion_shift",
 ]
-assert len(FEAT_COLS) == 271, f"expected 271, got {len(FEAT_COLS)}"
+assert len(FEAT_COLS) == 310, f"expected 310, got {len(FEAT_COLS)}"
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def _process_keyword(args):
-    kw, s_arr, c_arr, plats, pred_idx, dates, s_inv, stride = args
+    kw, s_arr, c_arr, plats, pred_idx, dates, s_inv, stride, cached_sf = args
     rows, skipped = [], 0
     for ti in pred_idx[::stride]:
-        r = compute(s_arr, c_arr, plats, ti, s_inv)
-        if r is None:
+        lo, hi = ti - LB, ti + FW
+        if lo < 0 or hi > len(s_arr):
             skipped += 1
             continue
-        r["keyword"] = kw
+        if s_inv[lo:lo + 30].all():
+            skipped += 1
+            continue
+        s_lb = s_arr[lo:ti]
+        if float(np.std(s_lb)) == 0:
+            skipped += 1
+            continue
+        c_lb = c_arr[lo:ti]
+
+        # sig_feat: 캐시에서 조회하거나 직접 계산
+        if cached_sf is not None and ti in cached_sf:
+            row = dict(cached_sf[ti])
+        else:
+            sf = sig_feat(s_lb, "search")
+            cf = sig_feat(c_lb, "click")
+            row = {}
+            row.update(sf)
+            row.update(cf)
+            for p, arr in plats.items():
+                row.update(sig_feat(arr[lo:ti], p))
+
+        # cross_feat
+        sf = {k: v for k, v in row.items() if k.startswith("search_") or k == "days_since_search_max_14d"}
+        cf = {k: v for k, v in row.items() if k.startswith("click_") or k == "days_since_click_max_14d"}
+        pfs = {}
+        for p in ["blog", "instagram"]:
+            pfs[p] = {k: v for k, v in row.items() if k.startswith(f"{p}_") or k == f"days_since_{p}_max_14d"}
+
+        plat_lbs = {p: plats[p][lo:ti] for p in plats}
+        all_lbs = {"search": s_lb, "click": c_lb}
+        all_lbs.update(plat_lbs)
+        row.update(cross_feat(sf, cf, pfs, all_lbs))
+
+        # surge
+        for pp in ["blog", "instagram"]:
+            p_lb = plat_lbs.get(pp, np.zeros(LB, dtype=np.float64))
+            p_base = float(np.mean(p_lb[:30]))
+            for sn in [3, 7]:
+                if p_base > EPS:
+                    row[f"{pp}_surge_intensity_{sn}d"] = float(np.clip(np.max(p_lb[-sn:]) / p_base - 1, 0, 50))
+                else:
+                    row[f"{pp}_surge_intensity_{sn}d"] = 0.0
+                if p_base > EPS:
+                    row[f"{pp}_surge_accel_{sn}d"] = float(np.polyfit(np.arange(sn), p_lb[-sn:], 1)[0]) / p_base
+                else:
+                    row[f"{pp}_surge_accel_{sn}d"] = 0.0
+            p_peak = int(np.argmax(p_lb[-14:]))
+            s_peak = int(np.argmax(s_lb[-14:]))
+            row[f"{pp}_surge_lead_days"] = s_peak - p_peak
+
+        # calendar + labels
+        row["keyword"] = kw
         dt = dates[ti]
-        r["date"] = dt.date()
-        r["month"] = dt.month
-        rows.append(r)
+        row["date"] = dt.date()
+        row["month"] = dt.month
+
+        s_fw, c_fw = s_arr[ti:hi], c_arr[ti:hi]
+        b_lb = plats.get("blog", np.zeros(LB))[lo:ti]
+        b_fw = plats.get("blog", np.zeros(len(s_arr)))[ti:hi]
+        i_lb = plats.get("instagram", np.zeros(LB))[lo:ti]
+        i_fw = plats.get("instagram", np.zeros(len(s_arr)))[ti:hi]
+        row.update(compute_labels(s_fw, c_fw, b_fw, i_fw, s_lb, c_lb, b_lb, i_lb))
+        rows.append(row)
     return rows, skipped
+
+
+def _build_signals(search, click, mention, kws, dates):
+    """L1: 키워드별 전처리된 시그널 배열 생성 또는 캐시 로드"""
+    import h5py
+    meta = _load_meta()
+    h5_path = CACHE_DIR / "signals.h5"
+
+    if _l1_valid(meta):
+        print("  [L1 cache hit] signals.h5 로드")
+        signals = {}
+        with h5py.File(h5_path, "r") as f:
+            for kw in kws:
+                g = f[kw]
+                signals[kw] = {
+                    "s": g["search"][:], "c": g["click"][:],
+                    "s_inv": g["s_inv"][:].astype(bool),
+                    "plats": {p: g[p][:] for p in ["blog", "instagram"]},
+                }
+        return signals
+
+    print("  [L1 cache miss] fill_sig 실행")
+    signals = {}
+    for kw in kws:
+        sr = search.loc[kw, dates]
+        s_inv = (sr.isna() | (sr == 0)).values
+        s = fill_sig(sr)
+        c = fill_sig(click.loc[kw, dates])
+        plats = {}
+        for pfx, mdf in mention.items():
+            if kw in mdf.index:
+                plats[pfx] = fill_sig(mdf.loc[kw].reindex(dates))
+            else:
+                plats[pfx] = np.zeros(len(dates), dtype=np.float64)
+        signals[kw] = {"s": s, "c": c, "s_inv": s_inv, "plats": plats}
+
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with h5py.File(h5_path, "w") as f:
+        for kw, sig in signals.items():
+            g = f.create_group(kw)
+            g.create_dataset("search", data=sig["s"])
+            g.create_dataset("click", data=sig["c"])
+            g.create_dataset("s_inv", data=sig["s_inv"].astype(np.uint8))
+            for p in ["blog", "instagram"]:
+                g.create_dataset(p, data=sig["plats"].get(p, np.zeros(len(dates))))
+
+    meta["l1_raw_mtime"] = _raw_mtime()
+    _save_meta(meta)
+    print(f"  [L1 cache saved] {h5_path}")
+    return signals
+
+
+def _sig_feat_worker(args):
+    """L2 워커: 키워드 하나의 sig_feat 계산"""
+    kw, s, c, plats, s_inv, pred_idx, stride = args
+    rows = []
+    for ti in pred_idx[::stride]:
+        lo = ti - LB
+        if lo < 0 or ti + FW > len(s):
+            continue
+        if s_inv[lo:lo + 30].all():
+            continue
+        s_lb = s[lo:ti]
+        if float(np.std(s_lb)) == 0:
+            continue
+        c_lb = c[lo:ti]
+        sf = sig_feat(s_lb, "search")
+        cf = sig_feat(c_lb, "click")
+        row = {"keyword": kw, "date_idx": ti}
+        row.update(sf)
+        row.update(cf)
+        for p, arr in plats.items():
+            row.update(sig_feat(arr[lo:ti], p))
+        rows.append(row)
+    return rows
+
+
+def _build_sig_feats(signals, kws, dates, pred_idx, stride):
+    """L2: sig_feat 결과 캐시 로드 또는 재계산 (multiprocessing)"""
+    from multiprocessing import Pool, cpu_count
+    meta = _load_meta()
+    pq_path = CACHE_DIR / "sig_feat.parquet"
+
+    if _l2_valid(meta):
+        print("  [L2 cache hit] sig_feat.parquet 로드")
+        return pd.read_parquet(pq_path)
+
+    n_workers = max(1, cpu_count() - 1)
+    print(f"  [L2 cache miss] sig_feat 재계산 (workers={n_workers})")
+
+    def gen_l2_tasks():
+        for kw in kws:
+            sig = signals[kw]
+            yield (kw, sig["s"], sig["c"], sig["plats"], sig["s_inv"], pred_idx, stride)
+
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    chunks, total = [], 0
+    CHUNK_FLUSH = 50  # 키워드 50개마다 parquet flush
+    part_files = []
+    with Pool(n_workers, maxtasksperchild=50) as pool:
+        for i, kw_rows in enumerate(pool.imap_unordered(_sig_feat_worker, gen_l2_tasks(), chunksize=10), 1):
+            chunks.extend(kw_rows)
+            total += len(kw_rows)
+            print(f"    sig_feat {i}/{len(kws)} ({total:,})")
+            if len(chunks) >= CHUNK_FLUSH * 1300:
+                part = CACHE_DIR / f"sig_feat_part{len(part_files)}.parquet"
+                pd.DataFrame(chunks).to_parquet(part, index=False)
+                part_files.append(part)
+                chunks.clear()
+    if chunks:
+        part = CACHE_DIR / f"sig_feat_part{len(part_files)}.parquet"
+        pd.DataFrame(chunks).to_parquet(part, index=False)
+        part_files.append(part)
+        chunks.clear()
+
+    df = pd.concat([pd.read_parquet(p) for p in part_files], ignore_index=True)
+    df.to_parquet(pq_path, index=False)
+    for p in part_files:
+        p.unlink()
+    meta["l2_sig_feat_hash"] = _sig_feat_hash()
+    _save_meta(meta)
+    print(f"  [L2 cache saved] {pq_path} ({len(df):,} rows)")
+    return df
 
 
 def main():
@@ -559,12 +818,25 @@ def main():
     from multiprocessing import Pool, cpu_count
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--stride", type=int, default=SAMPLE_STRIDE, help="샘플링 간격 (기본 7일)")
+    parser.add_argument("--stride", type=int, default=SAMPLE_STRIDE, help="샘플링 간격 (기본 1일)")
+    parser.add_argument("--no-cache", action="store_true", help="캐시 무시하고 전체 재생성")
+    parser.add_argument("--clear-cache", action="store_true", help="캐시 삭제 후 재생성")
     args = parser.parse_args()
     stride = args.stride
 
+    if args.clear_cache:
+        import shutil
+        if CACHE_DIR.exists():
+            shutil.rmtree(CACHE_DIR)
+            print("  [cache cleared]")
+
+    if args.no_cache or args.clear_cache:
+        # 캐시 무효화
+        if CACHE_META.exists():
+            CACHE_META.unlink()
+
     print("=" * 50)
-    print(f"building dataset (271 features, stride={stride})")
+    print(f"building dataset ({len(FEAT_COLS)} features, stride={stride})")
     print("=" * 50)
 
     search, click, mention = load_all()
@@ -576,28 +848,26 @@ def main():
     pred_idx = np.where(mask)[0]
     mention_kws = set(next(iter(mention.values())).index)
 
-    n_workers = max(1, cpu_count() - 1)
     est_samples = len(kws) * len(pred_idx[::stride])
     print(f"  {len(kws)} keywords, {len(dates)} days, {len(pred_idx)} pred dates")
     print(f"  stride={stride} → ~{est_samples:,} samples (before filter)")
     print(f"  mention: {len(kws.intersection(mention_kws))}/{len(kws)}")
+
+    # L1: 전처리 시그널
+    signals = _build_signals(search, click, mention, kws, dates)
+    del search, click, mention  # raw DataFrame 해제
+
+    # L2: sig_feat 캐시 (parquet 저장만, 메모리에 적재하지 않음)
+    _build_sig_feats(signals, kws, dates, pred_idx, stride)
+
+    # L3: cross_feat + surge + labels (multiprocessing)
+    n_workers = max(1, cpu_count() - 1)
     print(f"  workers: {n_workers}")
 
     def gen_tasks():
         for kw in kws:
-            sr = search.loc[kw, dates]
-            s_inv = (sr.isna() | (sr == 0)).values
-            s = fill_sig(sr)
-            c = fill_sig(click.loc[kw, dates])
-
-            plats = {}
-            for pfx, mdf in mention.items():
-                if kw in mdf.index:
-                    plats[pfx] = fill_sig(mdf.loc[kw].reindex(dates))
-                else:
-                    plats[pfx] = np.zeros(len(dates), dtype=np.float64)
-
-            yield (kw, s, c, plats, pred_idx, dates, s_inv, stride)
+            sig = signals[kw]
+            yield (kw, sig["s"], sig["c"], sig["plats"], pred_idx, dates, sig["s_inv"], stride, None)
 
     chunks, total, skipped = [], 0, 0
     with Pool(n_workers, maxtasksperchild=50) as pool:
@@ -612,12 +882,7 @@ def main():
 
     df = pd.concat(chunks, ignore_index=True)
     del chunks
-
-    # buzz_rank — 날짜별 buzz_composite 백분위 (0~100)
-    df["buzz_rank"] = df.groupby("date")["buzz_composite"].rank(pct=True) * 100
-    df["buzz_rank"] = df["buzz_rank"].round(2)
-
-    ALL_LABELS = LABEL_COLS + ["buzz_rank"]
+    ALL_LABELS = LABEL_COLS
     df = df[["keyword", "date"] + FEAT_COLS + ALL_LABELS]
     df.sort_values(["keyword", "date"], inplace=True)
     df.reset_index(drop=True, inplace=True)
