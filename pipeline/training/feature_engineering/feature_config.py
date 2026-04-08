@@ -12,7 +12,7 @@ RAW_COLS: list[str] = [
 ]
 
 # ── 피처 컬럼 (모델 입력, canonical 순서) ────────────────────────────────────────
-# v2 피처 테이블 (107개): 4개 신호원(검색/클릭/언급/인구통계) × 다양한 time window
+# v2 피처 테이블 (112개): 4개 신호원(검색/클릭/언급/인구통계) × 다양한 time window + 키워드별 peak_time 통계 5개
 FEATURE_COLS: list[str] = [
     # ── 검색량 기반 (27개) ──────────────────────────────────────────────────
     # 이동평균 (5개)
@@ -138,6 +138,13 @@ FEATURE_COLS: list[str] = [
     "viral_force_30d",
     "mention_peak_gap",
     
+    # ── 키워드별 peak_time 통계 (5개) ──────────────────────────────────────
+    "keyword_peak_time_mean",
+    "keyword_peak_time_median",
+    "keyword_peak_time_std",
+    "keyword_peak_time_recent30",
+    "keyword_peak_time_ewm",
+
     # ── 인구통계 (14개) ─────────────────────────────────────────────────────
     # 성별 (4개)
     "male_click_ratio",
@@ -165,7 +172,7 @@ TARGET_COLS: list[str] = [
 ]
 
 # ── 파생 그룹 (위 리스트에서 자동 생성) ────────────────────────────────────────
-ALL_COLS: list[str] = META_COLS + RAW_COLS + FEATURE_COLS + TARGET_COLS  # 총 127개
+ALL_COLS: list[str] = META_COLS + RAW_COLS + FEATURE_COLS + TARGET_COLS  # 총 132개
 
 # 없으면 ValueError (학습 불가)
 REQUIRED_COLS: list[str] = FEATURE_COLS + TARGET_COLS
