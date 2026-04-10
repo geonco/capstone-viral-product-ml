@@ -1,5 +1,6 @@
-# LSTM 데이터셋 빌드 — 60일 lookback × 4채널 시계열 → peak_time 3-class + 15개 회귀 라벨
-# 출력: lstm_X.npy (N, 60, 4), lstm_y.npy (N,), lstm_labels.npy (N, 15), lstm_meta.csv
+# LSTM 데이터셋 빌드 — 60일 z-score 시퀀스 + 보조 피처 + 13 라벨 + 궤적 타겟
+# seq_y를 같은 스크립트에서 생성해 순서 정합성 보장 (build_seq_y.py 대체)
+# 출력: lstm_X.npy, lstm_feat.npy, lstm_labels.npy, lstm_seq_y.npy, lstm_meta.csv
 
 import argparse
 import sys
@@ -10,44 +11,109 @@ from multiprocessing import Pool, cpu_count
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from pipeline.config import (
-    ROOT, START, END, LB, FW, SAMPLE_STRIDE, EPS,
-    SIGNAL_WEIGHTS, LABEL_COLS,
+    ROOT, START, END, LB, FW, EPS,
+    LSTM_SAMPLE_STRIDE, LSTM_LABEL_COLS, LSTM_FEAT_COLS,
 )
-from pipeline.features.build_dataset import load_all, _build_signals, compute_labels
+from pipeline.features.build_dataset import load_all, _build_signals
 
 # 출력 경로
-OUT_X      = ROOT / "data" / "processed" / "lstm_X.npy"
-OUT_Y      = ROOT / "data" / "processed" / "lstm_y.npy"
-OUT_LABELS = ROOT / "data" / "processed" / "lstm_labels.npy"
-OUT_META   = ROOT / "data" / "processed" / "lstm_meta.csv"
-
-# peak_time 구간 경계 — 0-indexed (argmax 기준)
-# class 0: peak_day 0~4   → 미래 1~5일 내 피크
-# class 1: peak_day 5~9   → 미래 6~10일 내 피크
-# class 2: peak_day 10~14 → 미래 11~15일 내 피크
-PEAK_BIN_EDGES = [5, 10]
+OUT_DIR    = ROOT / "data" / "processed"
+OUT_X      = OUT_DIR / "lstm_X.npy"
+OUT_FEAT   = OUT_DIR / "lstm_feat.npy"
+OUT_LABELS = OUT_DIR / "lstm_labels.npy"
+OUT_SEQ_Y  = OUT_DIR / "lstm_seq_y.npy"
+OUT_META   = OUT_DIR / "lstm_meta.csv"
 
 
-def _peak_class(fw_combined):
-    # 4채널 합산 forward window에서 피크 위치를 3-class로 변환
-    peak_day = int(np.argmax(fw_combined))
-    if peak_day < PEAK_BIN_EDGES[0]:
-        return 0
-    elif peak_day < PEAK_BIN_EDGES[1]:
-        return 1
-    else:
-        return 2
+# 13개 라벨 생성 — forward window 정보 기반, lookback 참조 최소화
+def compute_lstm_labels(combined_fw, combined_lb):
+    mean_lb = float(np.mean(combined_lb)) + EPS
+    labels = {}
+
+    # 규모 — 미래 N일 4채널 합산 평균의 log 스케일
+    labels["fw_magnitude_5d"]  = float(np.log1p(np.mean(combined_fw[:5])))
+    labels["fw_magnitude_10d"] = float(np.log1p(np.mean(combined_fw[:10])))
+    labels["fw_magnitude_15d"] = float(np.log1p(np.mean(combined_fw[:15])))
+
+    # 성장 — 과거 평균 대비 미래 평균 비율
+    labels["fw_growth_10d"] = float(np.clip(np.mean(combined_fw[:10]) / mean_lb, 0, 50))
+    labels["fw_growth_15d"] = float(np.clip(np.mean(combined_fw[:15]) / mean_lb, 0, 50))
+
+    # 피크 위치 — forward window 내 최고점 위치 (0=초반, 1=후반)
+    labels["fw_peak_pos_10d"] = float(np.argmax(combined_fw[:10])) / 9.0
+    labels["fw_peak_pos_15d"] = float(np.argmax(combined_fw[:15])) / 14.0
+
+    # 스파이크 강도 — 최고점이 평균 대비 얼마나 뾰족한가
+    mean_10 = float(np.mean(combined_fw[:10])) + EPS
+    mean_15 = float(np.mean(combined_fw[:15])) + EPS
+    labels["fw_spike_10d"] = float(np.clip(np.max(combined_fw[:10]) / mean_10, 1, 50))
+    labels["fw_spike_15d"] = float(np.clip(np.max(combined_fw[:15]) / mean_15, 1, 50))
+
+    # 변동성 — forward window 내 변동계수
+    labels["fw_cv_10d"] = float(np.clip(np.std(combined_fw[:10]) / mean_10, 0, 10))
+    labels["fw_cv_15d"] = float(np.clip(np.std(combined_fw[:15]) / mean_15, 0, 10))
+
+    # 하락 — 피크 대비 마지막 날의 하락률
+    max_10 = float(np.max(combined_fw[:10])) + EPS
+    max_15 = float(np.max(combined_fw[:15])) + EPS
+    labels["fw_decline_10d"] = float(np.clip((max_10 - float(combined_fw[9]))  / max_10, 0, 1))
+    labels["fw_decline_15d"] = float(np.clip((max_15 - float(combined_fw[14])) / max_15, 0, 1))
+
+    return labels
 
 
+# 보조 피처 — 시퀀스 z-score 정규화로 사라진 정보 보충
+def compute_lstm_features(s_lb, c_lb, b_lb, i_lb, month):
+    f = {}
+
+    # 스케일 — 절대 규모
+    f["scale_search"] = float(np.mean(s_lb))
+    f["scale_click"]  = float(np.mean(c_lb))
+    f["scale_blog"]   = float(np.mean(b_lb))
+    f["scale_insta"]  = float(np.mean(i_lb))
+    f["scale_total"]  = f["scale_search"] + f["scale_click"] + f["scale_blog"] + f["scale_insta"]
+
+    # 변동성 — 채널별 노이즈 수준
+    f["vol_search"] = float(np.std(s_lb))
+    f["vol_click"]  = float(np.std(c_lb))
+    f["vol_blog"]   = float(np.std(b_lb))
+    f["vol_insta"]  = float(np.std(i_lb))
+
+    # 채널 관계 — 채널 간 비율과 활성 채널 수
+    f["click_search_ratio"]  = f["scale_click"] / (f["scale_search"] + EPS)
+    f["social_search_ratio"] = (f["scale_blog"] + f["scale_insta"]) / (f["scale_search"] + EPS)
+    f["blog_insta_ratio"]    = f["scale_blog"] / (f["scale_insta"] + EPS)
+    f["active_channels"]     = float(sum(
+        1 for m in [f["scale_search"], f["scale_click"], f["scale_blog"], f["scale_insta"]]
+        if m > 1.0
+    ))
+
+    # 캘린더 — 주기적 월 인코딩
+    f["month_sin"] = float(np.sin(2 * np.pi * month / 12))
+    f["month_cos"] = float(np.cos(2 * np.pi * month / 12))
+
+    # 맥락 — 전체 트렌드와 현재 상태
+    combined_lb = s_lb + c_lb + b_lb + i_lb
+    f["total_trend"] = float(np.polyfit(np.arange(LB), combined_lb, 1)[0])
+    slope_7  = float(np.polyfit(np.arange(7),  combined_lb[-7:],  1)[0])
+    slope_30 = float(np.polyfit(np.arange(30), combined_lb[-30:], 1)[0])
+    f["recent_accel"]   = slope_7 - slope_30
+    f["peak_recency"]   = float(np.argmax(combined_lb)) / (LB - 1)
+    f["activity_ratio"] = float(np.sum(s_lb > 0)) / LB
+
+    return f
+
+
+# 키워드 하나의 전체 예측 시점에서 시퀀스, 피처, 라벨, 궤적 타겟 생성
 def _process_keyword(args):
-    # 키워드 하나의 전체 예측 시점을 순회하며 (시퀀스, peak_class, 15라벨, 메타) 생성
     kw, s_arr, c_arr, plats, pred_idx, dates, s_inv, stride = args
 
-    X_rows      = []
-    y_rows      = []
-    label_rows  = []
-    meta_rows   = []
-    skipped     = 0
+    X_rows     = []
+    feat_rows  = []
+    label_rows = []
+    seq_y_rows = []
+    meta_rows  = []
+    skipped    = 0
 
     blog_arr  = plats.get("blog",      np.zeros(len(s_arr), dtype=np.float64))
     insta_arr = plats.get("instagram", np.zeros(len(s_arr), dtype=np.float64))
@@ -57,12 +123,9 @@ def _process_keyword(args):
         if lo < 0 or hi > len(s_arr):
             skipped += 1
             continue
-
-        # lookback 앞 30일 전부 비활성이면 제외
         if s_inv[lo:lo + 30].all():
             skipped += 1
             continue
-
         s_lb = s_arr[lo:ti]
         if float(np.std(s_lb)) == 0:
             skipped += 1
@@ -72,12 +135,18 @@ def _process_keyword(args):
         b_lb = blog_arr[lo:ti]
         i_lb = insta_arr[lo:ti]
 
-        # 입력 시퀀스 — 채널별 lookback 평균으로 정규화해 상대 패턴만 남김
+        # 입력 시퀀스 — 채널별 z-score 정규화
         channels = [s_lb, c_lb, b_lb, i_lb]
         seq = np.zeros((LB, 4), dtype=np.float32)
         for ch_idx, ch in enumerate(channels):
-            baseline = float(np.mean(ch)) + EPS
-            seq[:, ch_idx] = (ch / baseline).astype(np.float32)
+            ch_mean = float(np.mean(ch))
+            ch_std  = float(np.std(ch)) + EPS
+            seq[:, ch_idx] = ((ch - ch_mean) / ch_std).astype(np.float32)
+
+        # 보조 피처
+        month = dates[ti].month
+        feat = compute_lstm_features(s_lb, c_lb, b_lb, i_lb, month)
+        feat_vec = np.array([feat[col] for col in LSTM_FEAT_COLS], dtype=np.float32)
 
         # forward window
         s_fw = s_arr[ti:hi]
@@ -85,39 +154,43 @@ def _process_keyword(args):
         b_fw = blog_arr[ti:hi]
         i_fw = insta_arr[ti:hi]
 
-        # peak_class — 4채널 합산 argmax 기반 3-class
-        fw_combined = s_fw + c_fw + b_fw + i_fw
-        peak_day    = int(np.argmax(fw_combined))
-        label       = _peak_class(fw_combined)
+        combined_fw = s_fw + c_fw + b_fw + i_fw
+        combined_lb = s_lb + c_lb + b_lb + i_lb
 
-        # 15개 회귀 라벨 — LightGBM과 동일한 compute_labels 재사용
-        lbl_dict = compute_labels(s_fw, c_fw, b_fw, i_fw, s_lb, c_lb, b_lb, i_lb)
-        lbl_vec  = np.array([lbl_dict[col] for col in LABEL_COLS], dtype=np.float32)
+        # 13개 라벨
+        lbl = compute_lstm_labels(combined_fw, combined_lb)
+        lbl_vec = np.array([lbl[col] for col in LSTM_LABEL_COLS], dtype=np.float32)
+
+        # 궤적 타겟 — 합산 신호의 z-score 정규화 (역변환용 mean/std 메타에 저장)
+        mean_c = float(np.mean(combined_lb))
+        std_c  = float(np.std(combined_lb)) + EPS
+        seq_y  = np.clip((combined_fw - mean_c) / std_c, -10, 10).astype(np.float32)
 
         X_rows.append(seq)
-        y_rows.append(label)
+        feat_rows.append(feat_vec)
         label_rows.append(lbl_vec)
+        seq_y_rows.append(seq_y)
         meta_rows.append({
             "keyword":    kw,
             "date":       dates[ti].date(),
-            "peak_day":   peak_day,
-            "peak_class": label,
+            "seq_y_mean": round(mean_c, 6),
+            "seq_y_std":  round(std_c, 6),
         })
 
-    return X_rows, y_rows, label_rows, meta_rows, skipped
+    return X_rows, feat_rows, label_rows, seq_y_rows, meta_rows, skipped
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--stride",  type=int, default=SAMPLE_STRIDE, help="샘플링 간격 (기본 1일)")
-    parser.add_argument("--workers", type=int, default=cpu_count(),   help="멀티프로세싱 코어 수 (기본 전체)")
-    parser.add_argument("--no-cache",    action="store_true", help="L1 신호 캐시 무시")
-    parser.add_argument("--clear-cache", action="store_true", help="L1 신호 캐시 삭제 후 재생성")
+    parser.add_argument("--stride",  type=int, default=LSTM_SAMPLE_STRIDE)
+    parser.add_argument("--workers", type=int, default=cpu_count())
+    parser.add_argument("--no-cache",    action="store_true")
+    parser.add_argument("--clear-cache", action="store_true")
     args = parser.parse_args()
 
     if args.clear_cache:
         import shutil
-        from pipeline.config import CACHE_DIR, CACHE_META
+        from pipeline.config import CACHE_DIR
         if CACHE_DIR.exists():
             shutil.rmtree(CACHE_DIR)
             print("  [cache cleared]")
@@ -127,12 +200,16 @@ def main():
         if CACHE_META.exists():
             CACHE_META.unlink()
 
-    print("=" * 50)
-    print(f"building LSTM dataset (stride={args.stride}, workers={args.workers})")
-    print(f"  input   : (N, {LB}, 4)  lookback {LB}d x 4ch")
-    print(f"  y       : 3-class  0=<=5d  1=6~10d  2=11~15d")
-    print(f"  labels  : {len(LABEL_COLS)} regression labels (same as LightGBM)")
-    print("=" * 50)
+    n_feat  = len(LSTM_FEAT_COLS)
+    n_label = len(LSTM_LABEL_COLS)
+
+    print("=" * 55)
+    print(f"LSTM dataset build (stride={args.stride}, workers={args.workers})")
+    print(f"  X      : (N, {LB}, 4)  z-score per channel")
+    print(f"  feat   : (N, {n_feat})")
+    print(f"  labels : (N, {n_label})")
+    print(f"  seq_y  : (N, {FW})  z-score trajectory")
+    print("=" * 55)
 
     search, click, mention = load_all()
 
@@ -143,9 +220,8 @@ def main():
     pred_idx = np.where(mask)[0]
 
     print(f"  {len(kws)} keywords  {len(dates)} days  {len(pred_idx)} pred dates")
-    print(f"  stride={args.stride} → ~{len(kws) * len(pred_idx[::args.stride]):,} samples (before filter)")
+    print(f"  stride={args.stride} -> ~{len(kws) * len(pred_idx[::args.stride]):,} (before filter)")
 
-    # L1 캐시에서 전처리 신호 로드 또는 생성
     signals = _build_signals(search, click, mention, kws, dates)
     del search, click, mention
 
@@ -154,50 +230,52 @@ def main():
             sig = signals[kw]
             yield (kw, sig["s"], sig["c"], sig["plats"], pred_idx, dates, sig["s_inv"], args.stride)
 
-    all_X, all_y, all_labels, all_meta = [], [], [], []
+    all_X, all_feat, all_labels, all_seq_y, all_meta = [], [], [], [], []
     total, skipped = 0, 0
 
     print(f"  workers: {args.workers}")
     with Pool(args.workers, maxtasksperchild=50) as pool:
-        for i, (X_rows, y_rows, label_rows, meta_rows, kw_skipped) in enumerate(
-            pool.imap_unordered(_process_keyword, gen_tasks(), chunksize=10), 1
-        ):
+        for i, result in enumerate(pool.imap(_process_keyword, gen_tasks(), chunksize=10), 1):
+            X_rows, feat_rows, label_rows, seq_y_rows, meta_rows, kw_skipped = result
             if X_rows:
                 all_X.extend(X_rows)
-                all_y.extend(y_rows)
+                all_feat.extend(feat_rows)
                 all_labels.extend(label_rows)
+                all_seq_y.extend(seq_y_rows)
                 all_meta.extend(meta_rows)
                 total += len(X_rows)
             skipped += kw_skipped
-            print(f"  {i}/{len(kws)} ({total:,} samples)")
+            if i % 50 == 0 or i == len(kws):
+                print(f"  {i}/{len(kws)} ({total:,} samples)")
 
     print(f"\n  {total:,} samples ({skipped:,} skipped)")
 
-    X      = np.stack(all_X,      axis=0)         # (N, 60, 4)  float32
-    y      = np.array(all_y,      dtype=np.int8)  # (N,)        int8
-    labels = np.stack(all_labels, axis=0)         # (N, 15)     float32
+    X      = np.stack(all_X,      axis=0)
+    feat   = np.stack(all_feat,   axis=0)
+    labels = np.stack(all_labels, axis=0)
+    seq_y  = np.stack(all_seq_y,  axis=0)
     meta   = pd.DataFrame(all_meta)
 
-    # peak_class 분포 확인
-    label_names = {0: "≤5d", 1: "6~10d", 2: "11~15d"}
-    for cls in range(3):
-        cnt = int((y == cls).sum())
-        print(f"  class {cls} ({label_names[cls]}): {cnt:,}  ({cnt / len(y) * 100:.1f}%)")
-
-    OUT_X.parent.mkdir(parents=True, exist_ok=True)
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
     np.save(OUT_X,      X)
-    np.save(OUT_Y,      y)
+    np.save(OUT_FEAT,   feat)
     np.save(OUT_LABELS, labels)
+    np.save(OUT_SEQ_Y,  seq_y)
     meta.to_csv(OUT_META, index=False, encoding="utf-8-sig")
 
-    print(f"\n  X shape      : {X.shape}  dtype={X.dtype}")
-    print(f"  y shape      : {y.shape}  dtype={y.dtype}")
-    print(f"  labels shape : {labels.shape}  dtype={labels.dtype}")
-    print(f"  label cols   : {LABEL_COLS}")
-    print(f"  saved → {OUT_X}")
-    print(f"  saved → {OUT_Y}")
-    print(f"  saved → {OUT_LABELS}")
-    print(f"  saved → {OUT_META}")
+    print(f"\n  X      : {X.shape}  {X.dtype}")
+    print(f"  feat   : {feat.shape}  {feat.dtype}")
+    print(f"  labels : {labels.shape}  {labels.dtype}")
+    print(f"  seq_y  : {seq_y.shape}  {seq_y.dtype}")
+
+    for i, col in enumerate(LSTM_LABEL_COLS):
+        v = labels[:, i]
+        print(f"  {col:25s}  mean={v.mean():.4f}  std={v.std():.4f}  min={v.min():.4f}  max={v.max():.4f}")
+
+    print(f"\n  seq_y  mean={seq_y.mean():.4f}  std={seq_y.std():.4f}  min={seq_y.min():.4f}  max={seq_y.max():.4f}")
+
+    for f_path in [OUT_X, OUT_FEAT, OUT_LABELS, OUT_SEQ_Y, OUT_META]:
+        print(f"  saved -> {f_path}")
 
 
 if __name__ == "__main__":

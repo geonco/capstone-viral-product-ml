@@ -195,3 +195,24 @@ REQUIRED_COLS = FEAT_COLS
 OPTIONAL_COLS = META_COLS + LABEL_COLS
 
 assert len(FEAT_COLS) == 348, f"expected 348, got {len(FEAT_COLS)}"
+
+# LSTM 전용 설정
+
+LSTM_SAMPLE_STRIDE = 3
+
+LSTM_FEAT_COLS = [
+    "scale_search", "scale_click", "scale_blog", "scale_insta", "scale_total",
+    "vol_search", "vol_click", "vol_blog", "vol_insta",
+    "click_search_ratio", "social_search_ratio", "blog_insta_ratio", "active_channels",
+    "month_sin", "month_cos",
+    "total_trend", "recent_accel", "peak_recency", "activity_ratio",
+]
+
+LSTM_LABEL_COLS = [
+    "fw_magnitude_5d", "fw_magnitude_10d", "fw_magnitude_15d",
+    "fw_growth_10d", "fw_growth_15d",
+    "fw_peak_pos_10d", "fw_peak_pos_15d",
+    "fw_spike_10d", "fw_spike_15d",
+    "fw_cv_10d", "fw_cv_15d",
+    "fw_decline_10d", "fw_decline_15d",
+]
