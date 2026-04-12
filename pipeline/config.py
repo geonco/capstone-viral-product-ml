@@ -73,7 +73,7 @@ TARGET_CONFIG = {
 # LightGBM 기본 하이퍼파라미터
 DEFAULT_PARAMS = {
     "boosting_type"    : "gbdt",
-    "n_estimators"     : 1000,
+    "n_estimators"     : 3000,
     "learning_rate"    : 0.05,
     "num_leaves"       : 64,
     "max_depth"        : -1,
@@ -98,6 +98,12 @@ SEARCH_SPACE = {
     "reg_alpha"        : ("float", 1e-3, 10.0,  True),
     "reg_lambda"       : ("float", 1e-3, 10.0,  True),
 }
+
+# 관성 피처 마스크 — 3일 집계 관성 피처, train.py --mask로 제외
+MASK_MOMENTUM = (
+    [f"{p}_slope_3d" for p in SIGNALS]
+    + [f"{p}_daily_returns_3d_avg" for p in SIGNALS]
+)
 
 # 컬럼 스키마 — FEAT_COLS/LABEL_COLS 생성, data_loader와 build_dataset에서 참조
 
