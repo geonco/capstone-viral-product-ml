@@ -4,3 +4,7 @@ python-dateutil
 numpy
 pyyaml
 requests
+lightgbm
+optuna
+shap
+scikit-learn
