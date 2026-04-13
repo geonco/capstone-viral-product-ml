@@ -6,9 +6,9 @@ from pathlib import Path
 # 프로젝트 경로 — raw 데이터, 빌드 결과, 캐시 위치
 
 ROOT       = Path(__file__).resolve().parent.parent
-RAW        = ROOT / "data" / "raw"
-OUT_PATH   = ROOT / "data" / "processed" / "dataset.csv"
-CACHE_DIR  = ROOT / "data" / "cache"
+RAW        = ROOT / "data_raw"
+OUT_PATH   = ROOT / "data_processed" / "dataset.csv"
+CACHE_DIR  = ROOT / "data_processed" / "cache"
 CACHE_META = CACHE_DIR / "meta.json"
 
 PATHS = {
