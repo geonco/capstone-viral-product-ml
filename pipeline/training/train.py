@@ -21,7 +21,7 @@ from sklearn.model_selection import train_test_split
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from pipeline.config import (
-    ROOT, FEAT_COLS, MASK_MOMENTUM,
+    ROOT, FEAT_COLS, MASK_REGISTRY,
     DATE_COL, TRAIN_RATIO, VALID_RATIO, GAP_DAYS,
     TARGET_CONFIG, DEFAULT_PARAMS, SEARCH_SPACE,
 )
@@ -453,7 +453,7 @@ def run_hurdle(
 
 
 # 메인 — CSV 로드 → 분할 → 타겟별 학습 실행
-def main(csv_path: str, target: str, do_tune: bool, n_trials: int, train_stride: int = 3, mask: bool = False, hurdle: float = None):
+def main(csv_path: str, target: str, do_tune: bool, n_trials: int, train_stride: int = 3, mask_names: list = None, hurdle: float = None):
     dirs = _make_run_dir(target)
     print(f"output → {os.path.dirname(dirs['figures'])}")
     print(f"target: {target}")
@@ -463,10 +463,15 @@ def main(csv_path: str, target: str, do_tune: bool, n_trials: int, train_stride:
 
     train_df, valid_df, test_df = split_data(df, train_stride=train_stride)
 
-    feat_cols = [c for c in FEAT_COLS if c not in set(MASK_MOMENTUM)] if mask else FEAT_COLS
-    if mask:
-        print(f"features: {len(feat_cols)} (masked {len(FEAT_COLS) - len(feat_cols)})")
+    # 마스크 적용 — 여러 마스크 조합 가능
+    if mask_names:
+        mask_set = set()
+        for name in mask_names:
+            mask_set.update(MASK_REGISTRY[name])
+        feat_cols = [c for c in FEAT_COLS if c not in mask_set]
+        print(f"features: {len(feat_cols)} (masked {len(FEAT_COLS) - len(feat_cols)}, groups: {mask_names})")
     else:
+        feat_cols = FEAT_COLS
         print(f"features: {len(feat_cols)}")
     print(f"train={len(train_df)}  valid={len(valid_df)}  test={len(test_df)}")
 
@@ -552,7 +557,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--target", type=str, default="sustainability_10d",
-        help="학습 타겟 (intensity/buzz_composite/growth/sustainability/crash + _5d/_10d/_15d, 또는 all)",
+        help="학습 타겟 (buzz_composite/growth/sustainability/crash + _5d/_10d/_15d, 또는 all)",
     )
     parser.add_argument(
         "--tune", action="store_true",
@@ -571,8 +576,8 @@ if __name__ == "__main__":
         help="train/valid 서브샘플링 간격 (test는 항상 stride=1, 기본값: 3)",
     )
     parser.add_argument(
-        "--mask", action="store_true",
-        help="관성 피처 제외 (slope_3d, daily_return, change_1~3d 등)",
+        "--mask", nargs="*", default=None, metavar="NAME",
+        help="피처 마스크 적용 (momentum, buzz, noise, dead, wave, surge 조합 가능)",
     )
     parser.add_argument(
         "--hurdle", type=float, default=None,
@@ -584,12 +589,13 @@ if __name__ == "__main__":
         print("GPU mode enabled")
 
     ALL_TARGETS = [
-        "intensity_5d", "intensity_10d", "intensity_15d",
         "buzz_composite_5d", "buzz_composite_10d", "buzz_composite_15d",
         "growth_5d", "growth_10d", "growth_15d",
         "sustainability_5d", "sustainability_10d", "sustainability_15d",
         "crash_5d", "crash_10d", "crash_15d",
+        "spike_5d", "spike_10d", "spike_15d",
     ]
     targets = ALL_TARGETS if args.target == "all" else [args.target]
     for t in targets:
         main(args.data, t, args.tune, args.n_trials, args.train_stride, args.mask, args.hurdle)
+

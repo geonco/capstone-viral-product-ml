@@ -243,6 +243,19 @@ def sig_feat(lb, p):
         change = (float(lb[-d]) - float(lb[-(d + 1)])) / (abs(float(lb[-(d + 1)])) + EPS)
         f[f"{p}_change_{d}d_ago"] = float(np.clip(change, -10, 100))
 
+    # 비대칭 변동성 — 하락/상승 일별 변화를 분리하여 각각 표준편차 산출
+    diffs_7 = np.diff(lb[-8:])
+    down_7 = diffs_7[diffs_7 < 0]
+    up_7   = diffs_7[diffs_7 > 0]
+    f[f"{p}_downside_std_7d"] = float(np.std(down_7)) if len(down_7) > 1 else 0.0
+    f[f"{p}_upside_std_7d"]   = float(np.std(up_7))   if len(up_7) > 1 else 0.0
+
+    # 개별 시그널 z-score — baseline 대비 최근 윈도우의 이상치 정도
+    sigma = float(np.std(lb))
+    for n in [3, 7]:
+        recent_mean = float(np.mean(lb[-n:]))
+        f[f"{p}_zscore_{n}d"] = (recent_mean - baseline) / (sigma + EPS) if sigma > EPS else 0.0
+
     return f
 
 
@@ -405,9 +418,6 @@ def compute_labels(s_fw, c_fw, b_fw, i_fw, s_lb, c_lb, b_lb, i_lb, kw_stats=None
     for w in [5, 10, 15]:
         fw_w = combined[:w]
 
-        # intensity — 4채널 합산 평균
-        labels[f"intensity_{w}d"] = round(float(np.mean(fw_w)), 6)
-
         # buzz_composite — 4채널 z-score 가중합 (lookback 기준, clip [-10,10])
         comp = 0.0
         for sig, wt in weights.items():
@@ -437,6 +447,10 @@ def compute_labels(s_fw, c_fw, b_fw, i_fw, s_lb, c_lb, b_lb, i_lb, kw_stats=None
         # crash — 현재에서 최저점까지 하락률
         cr = (current - float(np.min(fw_w))) / (current + EPS) if current > EPS else 0.0
         labels[f"crash_{w}d"] = round(float(np.clip(cr, 0, 10)), 6)
+
+        # spike — 현재에서 최고점까지 상승률 (crash 대칭)
+        sp = (float(np.max(fw_w)) - current) / (current + EPS) if current > EPS else 0.0
+        labels[f"spike_{w}d"] = round(float(np.clip(sp, 0, 50)), 6)
 
     return labels
 

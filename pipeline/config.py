@@ -53,9 +53,6 @@ GAP_DAYS    = 75               # LB + FW, train↔valid↔test 간 누수 방지
 
 # 타겟별 log1p 변환 여부
 TARGET_CONFIG = {
-    "intensity_5d":        {"log": True},
-    "intensity_10d":       {"log": True},
-    "intensity_15d":       {"log": True},
     "buzz_composite_5d":   {"log": False},
     "buzz_composite_10d":  {"log": False},
     "buzz_composite_15d":  {"log": False},
@@ -68,6 +65,9 @@ TARGET_CONFIG = {
     "crash_5d":            {"log": False},
     "crash_10d":           {"log": False},
     "crash_15d":           {"log": False},
+    "spike_5d":            {"log": False},
+    "spike_10d":           {"log": False},
+    "spike_15d":           {"log": False},
 }
 
 # LightGBM 기본 하이퍼파라미터
@@ -99,11 +99,55 @@ SEARCH_SPACE = {
     "reg_lambda"       : ("float", 1e-3, 10.0,  True),
 }
 
-# 관성 피처 마스크 — 3일 집계 관성 피처, train.py --mask로 제외
+# 피처 마스크 — train.py --mask <이름> 으로 선택 적용
+
+# 관성 마스크 — 3일 집계 관성 피처
 MASK_MOMENTUM = (
     [f"{p}_slope_3d" for p in SIGNALS]
     + [f"{p}_daily_returns_3d_avg" for p in SIGNALS]
 )
+
+# 자기회귀 마스크 — buzz_composite에서 past_buzz_zscore가 SHAP 38% 독점
+MASK_BUZZ_AUTOREGRESSIVE = [f"past_buzz_zscore_{n}d" for n in [1, 3, 7, 14, 30]]
+
+# 노이즈 마스크 — SHAP ≈ 0인 피처 일괄 제거
+
+MASK_DEAD = (
+    [f"{p}_momentum_divergence" for p in SIGNALS]
+    + [f"{p}_reversal_3d" for p in SIGNALS]
+    + [f"{p}_direction_streak" for p in SIGNALS]
+)
+
+MASK_WAVE = (
+    [f"{p}_vol_ratio" for p in SIGNALS]
+    + [f"{p}_range_squeeze" for p in SIGNALS]
+    + [f"{p}_damping" for p in SIGNALS]
+    + [f"{p}_zero_crossings_14d" for p in SIGNALS]
+)
+
+MASK_SURGE = (
+    [f"{pp}_surge_{kind}_{n}d"
+     for pp in ["blog", "instagram"]
+     for kind in ["intensity", "accel"]
+     for n in [3, 7]]
+    + [f"{pp}_surge_lead_days" for pp in ["blog", "instagram"]]
+)
+
+MASK_PCA = [f"past_channel_active_{n}d" for n in [1, 3, 7, 14, 30]]
+
+MASK_RESIDUAL = [f"{p}_residual_energy_7d" for p in SIGNALS]
+
+MASK_NOISE = MASK_DEAD + MASK_WAVE + MASK_SURGE + MASK_PCA + MASK_RESIDUAL
+
+# 이름 → 피처 목록 매핑 — train.py에서 참조
+MASK_REGISTRY = {
+    "momentum": MASK_MOMENTUM,
+    "buzz":     MASK_BUZZ_AUTOREGRESSIVE,
+    "noise":    MASK_NOISE,
+    "dead":     MASK_DEAD,
+    "wave":     MASK_WAVE,
+    "surge":    MASK_SURGE,
+}
 
 # 컬럼 스키마 — FEAT_COLS/LABEL_COLS 생성, data_loader와 build_dataset에서 참조
 
@@ -141,6 +185,12 @@ def _sig_cols(p):
     c += [f"{p}_momentum_divergence", f"{p}_daily_accel_1d"]
     for d in range(1, 8):
         c.append(f"{p}_change_{d}d_ago")
+
+    # 비대칭 변동성 — 하락/상승 일별 변화의 표준편차 분리
+    c += [f"{p}_downside_std_7d", f"{p}_upside_std_7d"]
+
+    # 개별 시그널 z-score — baseline 대비 최근 이상치 정도
+    c += [f"{p}_zscore_3d", f"{p}_zscore_7d"]
 
     return c
 
@@ -188,11 +238,11 @@ FEAT_COLS += ["month"]
 
 # 라벨 — forward window에서 산출하는 예측 타겟
 LABEL_COLS = [
-    "intensity_5d", "intensity_10d", "intensity_15d",
     "buzz_composite_5d", "buzz_composite_10d", "buzz_composite_15d",
     "growth_5d", "growth_10d", "growth_15d",
     "sustainability_5d", "sustainability_10d", "sustainability_15d",
     "crash_5d", "crash_10d", "crash_15d",
+    "spike_5d", "spike_10d", "spike_15d",
 ]
 
 META_COLS     = ["keyword", "date"]
@@ -200,4 +250,4 @@ ALL_COLS      = META_COLS + FEAT_COLS + LABEL_COLS
 REQUIRED_COLS = FEAT_COLS
 OPTIONAL_COLS = META_COLS + LABEL_COLS
 
-assert len(FEAT_COLS) == 348, f"expected 348, got {len(FEAT_COLS)}"
+assert len(FEAT_COLS) == 364, f"expected 364, got {len(FEAT_COLS)}"
