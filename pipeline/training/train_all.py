@@ -39,9 +39,19 @@ TARGET_STRATEGY = {
 
 # 구간 설정 — 패밀리별 경계(원본 스케일), 구간명, 회귀 시 log1p 여부
 BUCKET_CONFIG = {
-    "intensity":     {"thresholds": [569.0, 4057.0], "names": ["low",      "mid",     "high"],    "log": True,  "n_class": 3},
-    "growth":        {"thresholds": [0.90,  1.56],   "names": ["shrink",   "stable",  "surge"],   "log": True,  "n_class": 3},
-    "buzz_composite":{"thresholds": [-0.46, 1.02],   "names": ["negative", "neutral", "positive"],"log": False, "n_class": 3},
+    "intensity":     {"thresholds": [569.0, 800.0],       "names": ["low",    "mid",    "high"],                  "log": True,  "n_class": 3},
+    "growth":        {"thresholds": [0.90,  1.56,  5.0],  "names": ["shrink", "stable", "surge", "extreme"],      "log": True,  "n_class": 4},
+    "buzz_composite":{"thresholds": [-0.46, 1.02],        "names": ["negative", "neutral", "positive"],           "log": False, "n_class": 3},
+}
+
+# 구간별 회귀 파라미터 override — 패밀리+구간명 키로 DEFAULT_REG_PARAMS 일부를 덮어씀
+# alphas 키가 있으면 해당 alpha 목록으로 quantile 앙상블 학습
+BUCKET_REG_OVERRIDE = {
+    ("intensity", "high"):   {"num_leaves": 32, "min_child_samples": 50},
+    ("growth", "shrink"):    {"num_leaves": 32, "min_child_samples": 30},
+    ("growth", "stable"):    {"num_leaves": 32, "min_child_samples": 30},
+    ("growth", "surge"):     {"objective": "quantile", "num_leaves": 64, "min_child_samples": 20, "alphas": [0.75, 0.90]},
+    ("growth", "extreme"):   {"objective": "quantile", "num_leaves": 16, "min_child_samples": 10, "alphas": [0.75, 0.90]},
 }
 
 # extreme 구간(양 끝) 샘플 가중치 — 소수 클래스 학습 보완
@@ -50,7 +60,7 @@ EXTREME_WEIGHT = 2.0
 DEFAULT_CLF_PARAMS_3 = {
     "boosting_type": "gbdt", "objective": "multiclass", "num_class": 3,
     "n_estimators": 1000, "learning_rate": 0.05, "num_leaves": 64, "max_depth": -1,
-    "min_child_samples": 20, "subsample": 0.8, "colsample_bytree": 0.8,
+    "min_child_samples": 200, "subsample": 0.8, "colsample_bytree": 0.8,
     "reg_alpha": 0.1, "reg_lambda": 0.1, "random_state": 42, "n_jobs": -1, "verbose": -1,
     "metric": "multi_logloss",
 }
@@ -58,7 +68,7 @@ DEFAULT_CLF_PARAMS_3 = {
 DEFAULT_REG_PARAMS = {
     "boosting_type": "gbdt", "objective": "regression",
     "n_estimators": 1000, "learning_rate": 0.05, "num_leaves": 64, "max_depth": -1,
-    "min_child_samples": 20, "subsample": 0.8, "colsample_bytree": 0.8,
+    "min_child_samples": 200, "subsample": 0.8, "colsample_bytree": 0.8,
     "reg_alpha": 0.1, "reg_lambda": 0.1, "random_state": 42, "n_jobs": -1, "verbose": -1,
 }
 
@@ -83,12 +93,15 @@ def _family(target):
 
 
 def make_bucket(y, thresholds):
-    # 원본 스케일 경계 기준 구간 레이블 산출 — binary(0/1) 또는 3구간(0/1/2)
+    # 원본 스케일 경계 기준 구간 레이블 산출 — thresholds 길이에 따라 2/3/4구간 지원
     y = np.asarray(y)
     if len(thresholds) == 1:
         return np.where(y <= thresholds[0], 0, 1)
-    t1, t2 = thresholds[0], thresholds[1]
-    return np.where(y <= t1, 0, np.where(y <= t2, 1, 2))
+    if len(thresholds) == 2:
+        t1, t2 = thresholds
+        return np.where(y <= t1, 0, np.where(y <= t2, 1, 2))
+    t1, t2, t3 = thresholds[0], thresholds[1], thresholds[2]
+    return np.where(y <= t1, 0, np.where(y <= t2, 1, np.where(y <= t3, 2, 3)))
 
 
 def make_weight(buckets, n_class):
@@ -98,11 +111,15 @@ def make_weight(buckets, n_class):
 
 def soft_predict(clf, regressors, fallbacks, X, use_log):
     # clf 확률 가중합으로 최종 예측 — 구간 경계 불연속 완화
+    # regressors 값이 list이면 앙상블(평균), 단일 모델이면 그대로 사용
     proba = clf.predict_proba(X)
     preds = np.zeros(len(X))
     for b_idx, model in regressors.items():
         if model is None:
             reg_pred = np.full(len(X), fallbacks[b_idx])
+        elif isinstance(model, list):
+            raw = np.stack([m.predict(X) for m in model], axis=0).mean(axis=0)
+            reg_pred = np.expm1(raw) if use_log else raw
         else:
             reg_pred = model.predict(X)
             if use_log:
@@ -144,54 +161,61 @@ def split_data(df, train_stride=1):
     return train, valid, test
 
 
-def _run_study(X_tr, y_tr, X_va, y_va, fixed, search_space, n_trials, w_tr, is_clf):
-    # 단일 Optuna study — search_space 내 파라미터만 탐색
+def _run_study(X_tr, y_tr, X_va, y_va, fixed, n_trials, w_tr, is_clf, label, dirs):
+    # Optuna study — num_leaves/max_depth 탐색, trial별 best_iteration·과적합 기록
+    trial_records = []
+
     def objective(trial):
-        params = {**fixed, "n_estimators": 2000}
-        for name, spec in search_space.items():
-            if spec[0] == "float":
-                log = spec[3] if len(spec) > 3 else False
-                params[name] = trial.suggest_float(name, spec[1], spec[2], log=log)
-            elif spec[0] == "int":
-                params[name] = trial.suggest_int(name, spec[1], spec[2])
+        params = {
+            **fixed,
+            "n_estimators": 500,
+            "num_leaves": trial.suggest_int("num_leaves", 15, 127),
+            "max_depth":  trial.suggest_int("max_depth",   4,  10),
+        }
         m = lgb.LGBMClassifier(**params) if is_clf else lgb.LGBMRegressor(**params)
         m.fit(X_tr, y_tr, sample_weight=w_tr, eval_set=[(X_va, y_va)],
-              callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)])
-        pred = m.predict(X_va)
-        return float(np.mean(pred != y_va)) if is_clf else rmse_score(y_va, pred)
+              callbacks=[lgb.early_stopping(20, verbose=False), lgb.log_evaluation(-1)])
+
+        best_iter   = m.best_iteration_ if hasattr(m, "best_iteration_") else -1
+        pred_va     = m.predict(X_va)
+        pred_tr     = m.predict(X_tr)
+        score_va    = float(np.mean(pred_va != y_va)) if is_clf else rmse_score(y_va, pred_va)
+        score_tr    = float(np.mean(pred_tr != y_tr)) if is_clf else rmse_score(y_tr, pred_tr)
+        overfit_gap = round(score_va - score_tr, 6)  # 양수일수록 과적합
+
+        trial_records.append({
+            "trial":          trial.number,
+            "num_leaves":     params["num_leaves"],
+            "max_depth":      params["max_depth"],
+            "learning_rate":  params["learning_rate"],
+            "best_iteration": best_iter,
+            "train_score":    round(score_tr, 6),
+            "valid_score":    round(score_va, 6),
+            "overfit_gap":    overfit_gap,
+        })
+        return score_va
 
     study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=42))
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+
+    (pd.DataFrame(trial_records)
+     .sort_values("valid_score")
+     .reset_index(drop=True)
+     .to_csv(os.path.join(dirs["metrics"], f"tune_trials_{label}.csv"), index=False))
+
     return study.best_params, study.best_value
 
 
-def _tune(X_tr, y_tr, X_va, y_va, fixed, n_trials, w_tr=None, label=""):
-    # 단계별 튜닝 — STEP1: num_leaves/max_depth, STEP2: learning_rate
+def _tune(X_tr, y_tr, X_va, y_va, fixed, n_trials, dirs, w_tr=None, label=""):
+    # num_leaves / max_depth Optuna 탐색 — learning_rate는 DEFAULT_PARAMS에서 수동 설정
     is_clf = fixed.get("objective") in ("multiclass", "binary")
-    print(f"    [tune] {label}")
+    lr     = fixed.get("learning_rate", 0.05)
+    print(f"    [tune] {label}  lr={lr}  trials={n_trials}")
 
-    # STEP 1 — learning_rate 고정, num_leaves / max_depth 탐색
-    print(f"      STEP1: num_leaves / max_depth (lr=0.05, trials={n_trials})")
-    space_tree = {
-        "num_leaves": ("int",   15, 127),
-        "max_depth":  ("int",    4,  10),
-    }
-    best1, val1 = _run_study(X_tr, y_tr, X_va, y_va,
-                             {**fixed, "learning_rate": 0.05},
-                             space_tree, n_trials, w_tr, is_clf)
-    print(f"      best: {val1:.4f}  {best1}")
+    best, val = _run_study(X_tr, y_tr, X_va, y_va, fixed, n_trials, w_tr, is_clf, label, dirs)
+    print(f"      best: {val:.4f}  {best}")
 
-    # STEP 2 — STEP1 결과 고정, learning_rate 탐색
-    print(f"      STEP2: learning_rate (trials={max(n_trials // 2, 10)})")
-    space_lr = {
-        "learning_rate": ("float", 0.01, 0.15, True),
-    }
-    best2, val2 = _run_study(X_tr, y_tr, X_va, y_va,
-                             {**fixed, **best1},
-                             space_lr, max(n_trials // 2, 10), w_tr, is_clf)
-    print(f"      best: {val2:.4f}  {best2}")
-
-    return {**fixed, **best1, **best2}
+    return {**fixed, **best}
 
 
 def _shap_save(model, X, label, dirs):
@@ -243,9 +267,9 @@ def run_staged(X_tr, y_tr, X_va, y_va, X_te, y_te, target, dirs, do_tune, n_tria
 
     # STEP 1 — 분류기 학습
     print("\n  [STEP 1] Classifier")
-    clf_params = DEFAULT_CLF_PARAMS_3.copy()
+    clf_params = {**DEFAULT_CLF_PARAMS_3, "num_class": n_class}
     if do_tune:
-        clf_params = _tune(X_tr, b_tr, X_va, b_va, clf_params, n_trials, w_tr, label=f"{target}_clf")
+        clf_params = _tune(X_tr, b_tr, X_va, b_va, clf_params, n_trials, dirs, w_tr, label=f"{target}_clf")
 
     clf = lgb.LGBMClassifier(**clf_params)
     clf.fit(X_tr, b_tr, sample_weight=w_tr, eval_set=[(X_va, b_va)],
@@ -280,27 +304,50 @@ def run_staged(X_tr, y_tr, X_va, y_va, X_te, y_te, target, dirs, do_tune, n_tria
             xv_b = X_tr[mask_tr].iloc[:k]
             yv_b = y_tr_b[:k]
 
-        reg_params = DEFAULT_REG_PARAMS.copy()
-        if do_tune:
-            reg_params = _tune(X_tr[mask_tr], y_tr_b, xv_b, yv_b,
-                               reg_params, n_trials, label=f"{target}_reg_{name}")
+        override    = BUCKET_REG_OVERRIDE.get((fam, name), {})
+        alphas      = override.pop("alphas", None) if isinstance(override, dict) else None
+        override    = {k: v for k, v in BUCKET_REG_OVERRIDE.get((fam, name), {}).items() if k != "alphas"}
+        reg_params  = {**DEFAULT_REG_PARAMS, **override}
 
-        reg = lgb.LGBMRegressor(**reg_params)
-        reg.fit(X_tr[mask_tr], y_tr_b, eval_set=[(xv_b, yv_b)],
-                callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(-1)])
-        regressors[b_idx] = reg
-        reg.booster_.save_model(os.path.join(dirs["models"], f"lgbm_{target}_reg_{name}.txt"))
+        if alphas:
+            # quantile 앙상블 — alpha별 모델 각각 학습 후 리스트로 저장
+            regs = []
+            for alpha in alphas:
+                p = {**reg_params, "objective": "quantile", "alpha": alpha}
+                r = lgb.LGBMRegressor(**p)
+                r.fit(X_tr[mask_tr], y_tr_b, eval_set=[(xv_b, yv_b)],
+                      callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(-1)])
+                r.booster_.save_model(os.path.join(dirs["models"], f"lgbm_{target}_reg_{name}_q{int(alpha*100)}.txt"))
+                regs.append(r)
+            regressors[b_idx] = regs
+            te_mask = b_te == b_idx
+            shap_X  = X_te[te_mask].iloc[:min(3000, te_mask.sum())] if te_mask.sum() > 0 else X_te.iloc[:1]
+            _shap_save(regs[0], shap_X, f"{target}_reg_{name}", dirs)
+        else:
+            if do_tune:
+                reg_params = _tune(X_tr[mask_tr], y_tr_b, xv_b, yv_b,
+                                   reg_params, n_trials, dirs, label=f"{target}_reg_{name}")
+            reg = lgb.LGBMRegressor(**reg_params)
+            reg.fit(X_tr[mask_tr], y_tr_b, eval_set=[(xv_b, yv_b)],
+                    callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(-1)])
+            regressors[b_idx] = reg
+            reg.booster_.save_model(os.path.join(dirs["models"], f"lgbm_{target}_reg_{name}.txt"))
+            te_mask = b_te == b_idx
+            shap_X  = X_te[te_mask].iloc[:min(3000, te_mask.sum())] if te_mask.sum() > 0 else X_te.iloc[:1]
+            _shap_save(reg, shap_X, f"{target}_reg_{name}", dirs)
 
-        te_mask = b_te == b_idx
-        shap_X  = X_te[te_mask].iloc[:min(3000, te_mask.sum())] if te_mask.sum() > 0 else X_te.iloc[:1]
-        _shap_save(reg, shap_X, f"{target}_reg_{name}", dirs)
-
-    # STEP 3 — soft routing 전체 평가
+    # STEP 3 — soft routing 전체 평가 + 구간별 MAE
     print("\n  [STEP 3] 전체 평가")
     results = []
-    for split_name, X, y in [("train", X_tr, y_tr), ("valid", X_va, y_va), ("test", X_te, y_te)]:
+    for split_name, X, y, b in [("train", X_tr, y_tr, b_tr), ("valid", X_va, y_va, b_va), ("test", X_te, y_te, b_te)]:
         pred = soft_predict(clf, regressors, fallbacks, X, use_log)
         results.append(_evaluate(y, pred, split_name, target))
+        # 구간별 MAE
+        for b_idx, name in enumerate(names):
+            mask = b == b_idx
+            if mask.sum() > 0:
+                mae_b = float(mean_absolute_error(y[mask], pred[mask]))
+                print(f"    [{split_name}][{name}] MAE={mae_b:.4f}  n={mask.sum()}")
 
     return results
 
@@ -317,7 +364,7 @@ def run_single(X_tr, y_tr, X_va, y_va, X_te, y_te, target, dirs, do_tune, n_tria
 
     params = {**DEFAULT_PARAMS}
     if do_tune:
-        params = _tune(X_tr, y_tr_t, X_va, y_va_t, params, n_trials, label=target)
+        params = _tune(X_tr, y_tr_t, X_va, y_va_t, params, n_trials, dirs, label=target)
 
     model = lgb.LGBMRegressor(**params)
     model.fit(X_tr, y_tr_t, eval_set=[(X_va, y_va_t)],
