@@ -77,7 +77,7 @@ DEFAULT_PARAMS = {
     "learning_rate"    : 0.05,
     "num_leaves"       : 64,
     "max_depth"        : -1,
-    "min_child_samples": 20,
+    "min_child_samples": 200,
     "subsample"        : 0.8,
     "colsample_bytree" : 0.8,
     "reg_alpha"        : 0.1,
