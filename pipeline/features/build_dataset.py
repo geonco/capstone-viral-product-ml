@@ -10,7 +10,7 @@ from pipeline.config import (
     SIGNALS, SIGNAL_WEIGHTS, MENTION_COLS,
     W_FULL, W_STAT, W_SHORT,
     START, END, LB, FW, SAMPLE_STRIDE, EPS, CLIP,
-    FEAT_COLS, LABEL_COLS,
+    FEAT_COLS, LABEL_COLS, SIG_COMMUNITY_ALLOW,
 )
 
 
@@ -90,25 +90,28 @@ def _rsi(arr, period=14):
 
 # 신호별 피처 — lookback 구간에서 통계·추세·파동·모멘텀 산출
 
-def sig_feat(lb, p):
-    # lb: lookback 배열, p: 신호 prefix (search/click/blog/instagram)
+def sig_feat(lb, p, allow=None):
+    # lb: lookback 배열, p: 신호 prefix (search/click/blog/instagram/community)
+    # allow: 반환할 피처 이름 set. None이면 모두. community처럼 제한 재도입 시 사용
     baseline = float(np.mean(lb))
     f = {}
 
-    # 절대 규모 — 윈도우별 평균값
+    # 절대 규모 — 윈도우별 평균값 + log1p 변환 (heavy tail 완화)
     for n in W_SHORT:
-        f[f"{p}_volume_{n}d"] = float(np.mean(lb[-n:]))
+        vol = float(np.mean(lb[-n:]))
+        f[f"{p}_volume_{n}d"] = vol
+        f[f"{p}_log_volume_{n}d"] = float(np.log1p(max(vol, 0.0)))
 
     # 상대 위치 — 전체 평균 대비 최근 윈도우 비율
     for n in W_SHORT:
         f[f"{p}_level_{n}d"] = _clip(np.mean(lb[-n:]) / (baseline + EPS), "level")
 
-    # 성장률 — 최근 n일 vs 이전 n일 평균 비율
+    # 성장률 — n=30은 level_30d와 |r|=1.00 중복으로 제거. 가속도 계산에는 W_FULL 전체 필요하므로 내부 _g는 유지
     _g = {}
     for n in W_FULL:
         r, pr = lb[-n:], lb[-2 * n : -n]
         _g[n] = _clip(np.mean(r) / (np.mean(pr) + EPS) - 1, "growth")
-    for n in W_SHORT:
+    for n in [3, 7, 14]:
         f[f"{p}_growth_{n}d"] = _g[n]
 
     # 가속도 — 단기/중기/장기 성장률 간 차이
@@ -147,9 +150,11 @@ def sig_feat(lb, p):
     for n in [1, 3, 7, 14, 30]:
         f[f"{p}_lag_{n}d"] = float(lb[-n]) / (baseline + EPS)
 
-    # 표준편차 — 윈도우별 분산 크기
+    # 표준편차 — 윈도우별 분산 크기 + log1p
     for n in W_STAT:
-        f[f"{p}_std_{n}d"] = float(np.std(lb[-n:]))
+        s = float(np.std(lb[-n:]))
+        f[f"{p}_std_{n}d"] = s
+        f[f"{p}_log_std_{n}d"] = float(np.log1p(max(s, 0.0)))
 
     # 위치 — 최근 값이 윈도우 내 최고점 대비 어디에 있는지
     smooth = float(np.mean(lb[-3:]))
@@ -178,7 +183,7 @@ def sig_feat(lb, p):
     else:
         r2 = 0.0
     f[f"{p}_trend_r2_7d"] = r2
-    f[f"{p}_residual_energy_7d"] = 1.0 - r2
+    # residual_energy_7d = 1 - trend_r2_7d 로 |r|=1.00 수식중복, 제거됨 (2026-04-13)
     f[f"{p}_curvature_14d"] = float(np.polyfit(np.arange(14), lb[-14:], 2)[0])
 
     # 파동 — 변동성 비율, 진폭 감쇠, 방향 전환 빈도
@@ -218,7 +223,7 @@ def sig_feat(lb, p):
     lower = mu_30 - 2 * std_30
     band_range = upper - lower
     f[f"{p}_band_position"] = float(lb[-1] - lower) / (band_range + EPS)
-    f[f"{p}_band_width"] = band_range / (mu_30 + EPS)
+    # band_width = band_range / mu_30 ≡ cv_30d (4σ 스케일링 차이), 수식중복 제거됨 (2026-04-13)
     f[f"{p}_drawdown_14d"] = (float(lb[-1]) - float(np.max(lb[-14:]))) / (float(np.max(lb[-14:])) + EPS)
     f[f"{p}_breakout_strength"] = (float(lb[-1]) - upper) / (std_30 + EPS)
     bp_3d_ago = (float(lb[-4]) - lower) / (band_range + EPS)
@@ -238,10 +243,27 @@ def sig_feat(lb, p):
     daily_accel_arr = np.diff(lb[-3:])
     f[f"{p}_daily_accel_1d"] = float(daily_accel_arr[-1] - daily_accel_arr[0]) if len(daily_accel_arr) >= 2 else 0.0
 
-    # 일별 변화율 — 최근 7일간 개별 일차 변화율
-    for d in range(1, 8):
+    # 일별 변화율 — 최근 7일간 개별 일차 변화율. d=1은 daily_return_1d와 동일(r=1.00), 제거됨 (2026-04-13)
+    for d in range(2, 8):
         change = (float(lb[-d]) - float(lb[-(d + 1)])) / (abs(float(lb[-(d + 1)])) + EPS)
         f[f"{p}_change_{d}d_ago"] = float(np.clip(change, -10, 100))
+
+    # 비대칭 변동성 — 하락/상승 일별 변화를 분리하여 각각 표준편차 산출
+    diffs_7 = np.diff(lb[-8:])
+    down_7 = diffs_7[diffs_7 < 0]
+    up_7   = diffs_7[diffs_7 > 0]
+    f[f"{p}_downside_std_7d"] = float(np.std(down_7)) if len(down_7) > 1 else 0.0
+    f[f"{p}_upside_std_7d"]   = float(np.std(up_7))   if len(up_7) > 1 else 0.0
+
+    # 개별 시그널 z-score — baseline 대비 최근 윈도우의 이상치 정도
+    sigma = float(np.std(lb))
+    for n in [3, 7]:
+        recent_mean = float(np.mean(lb[-n:]))
+        f[f"{p}_zscore_{n}d"] = (recent_mean - baseline) / (sigma + EPS) if sigma > EPS else 0.0
+
+    # allow 필터 — community처럼 허용 피처만 반환
+    if allow is not None:
+        f = {k: v for k, v in f.items() if k in allow}
 
     return f
 
@@ -405,9 +427,6 @@ def compute_labels(s_fw, c_fw, b_fw, i_fw, s_lb, c_lb, b_lb, i_lb, kw_stats=None
     for w in [5, 10, 15]:
         fw_w = combined[:w]
 
-        # intensity — 4채널 합산 평균
-        labels[f"intensity_{w}d"] = round(float(np.mean(fw_w)), 6)
-
         # buzz_composite — 4채널 z-score 가중합 (lookback 기준, clip [-10,10])
         comp = 0.0
         for sig, wt in weights.items():
@@ -437,6 +456,10 @@ def compute_labels(s_fw, c_fw, b_fw, i_fw, s_lb, c_lb, b_lb, i_lb, kw_stats=None
         # crash — 현재에서 최저점까지 하락률
         cr = (current - float(np.min(fw_w))) / (current + EPS) if current > EPS else 0.0
         labels[f"crash_{w}d"] = round(float(np.clip(cr, 0, 10)), 6)
+
+        # spike — 현재에서 최고점까지 상승률 (crash 대칭)
+        sp = (float(np.max(fw_w)) - current) / (current + EPS) if current > EPS else 0.0
+        labels[f"spike_{w}d"] = round(float(np.clip(sp, 0, 50)), 6)
 
     return labels
 
@@ -470,7 +493,11 @@ def _process_keyword(args):
             row.update(sf)
             row.update(cf)
             for p, arr in plats.items():
-                row.update(sig_feat(arr[lo:ti], p))
+                if p == "community":
+                    # 커뮤니티는 drift 위험으로 상대화 피처만 허용 (memory/feedback_sometrend_channels.md)
+                    row.update(sig_feat(arr[lo:ti], p, allow=SIG_COMMUNITY_ALLOW))
+                else:
+                    row.update(sig_feat(arr[lo:ti], p))
 
         # cross_feat
         sf = {k: v for k, v in row.items() if k.startswith("search_") or k == "days_since_search_max_14d"}
@@ -484,8 +511,8 @@ def _process_keyword(args):
         all_lbs.update(plat_lbs)
         row.update(cross_feat(sf, cf, pfs, all_lbs))
 
-        # surge
-        for pp in ["blog", "instagram"]:
+        # surge — blog/instagram/community 모두 급등 강도·가속도·선행 일수
+        for pp in ["blog", "instagram", "community"]:
             p_lb = plat_lbs.get(pp, np.zeros(LB, dtype=np.float64))
             p_base = float(np.mean(p_lb[:30]))
             for sn in [3, 7]:
@@ -501,12 +528,15 @@ def _process_keyword(args):
             s_peak = int(np.argmax(s_lb[-14:]))
             row[f"{pp}_surge_lead_days"] = s_peak - p_peak
 
-        # calendar + labels
+        # calendar + labels — month는 PSI=7.92로 제거, sin/cos circular encoding으로 대체
         row["keyword"] = kw
         dt = dates[ti]
         row["date"] = dt.date()
-        row["month"] = dt.month
+        m = dt.month
+        row["month_sin"] = float(np.sin(2.0 * np.pi * m / 12.0))
+        row["month_cos"] = float(np.cos(2.0 * np.pi * m / 12.0))
 
+        # 라벨 계산은 기존 4채널 가중치 유지 — 커뮤니티는 라벨 산출에 포함하지 않음
         s_fw, c_fw = s_arr[ti:hi], c_arr[ti:hi]
         b_lb = plats.get("blog", np.zeros(LB))[lo:ti]
         b_fw = plats.get("blog", np.zeros(len(s_arr)))[ti:hi]
@@ -526,13 +556,14 @@ def _build_signals(search, click, mention, kws, dates):
     if _l1_valid(meta):
         print("  [L1 cache hit] signals.h5 로드")
         signals = {}
+        plat_names = list(MENTION_COLS.values())  # blog, instagram, community
         with h5py.File(h5_path, "r") as f:
             for kw in kws:
                 g = f[kw]
                 signals[kw] = {
                     "s": g["search"][:], "c": g["click"][:],
                     "s_inv": g["s_inv"][:].astype(bool),
-                    "plats": {p: g[p][:] for p in ["blog", "instagram"]},
+                    "plats": {p: g[p][:] for p in plat_names if p in g},
                 }
         return signals
 
@@ -552,13 +583,14 @@ def _build_signals(search, click, mention, kws, dates):
         signals[kw] = {"s": s, "c": c, "s_inv": s_inv, "plats": plats}
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    plat_names = list(MENTION_COLS.values())  # blog, instagram, community
     with h5py.File(h5_path, "w") as f:
         for kw, sig in signals.items():
             g = f.create_group(kw)
             g.create_dataset("search", data=sig["s"])
             g.create_dataset("click", data=sig["c"])
             g.create_dataset("s_inv", data=sig["s_inv"].astype(np.uint8))
-            for p in ["blog", "instagram"]:
+            for p in plat_names:
                 g.create_dataset(p, data=sig["plats"].get(p, np.zeros(len(dates))))
 
     meta["l1_raw_mtime"] = _raw_mtime()
