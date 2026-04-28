@@ -6,9 +6,9 @@ from pathlib import Path
 # 프로젝트 경로 — raw 데이터, 빌드 결과, 캐시 위치
 
 ROOT       = Path(__file__).resolve().parent.parent
-RAW        = ROOT / "data" / "raw"
-OUT_PATH   = ROOT / "data" / "processed" / "dataset.csv"
-CACHE_DIR  = ROOT / "data" / "cache"
+RAW        = ROOT / "data_raw"
+OUT_PATH   = ROOT / "data_processed" / "dataset.csv"
+CACHE_DIR  = ROOT / "data_processed" / "cache"
 CACHE_META = CACHE_DIR / "meta.json"
 
 PATHS = {
@@ -88,7 +88,7 @@ DEFAULT_PARAMS = {
     "learning_rate"    : 0.05,
     "num_leaves"       : 64,
     "max_depth"        : -1,
-    "min_child_samples": 20,
+    "min_child_samples": 200,
     "subsample"        : 0.8,
     "colsample_bytree" : 0.8,
     "reg_alpha"        : 0.1,
@@ -514,3 +514,25 @@ print(f"[config] MASK_REGISTRY={len(MASK_REGISTRY)}, MASK_COMBOS={len(MASK_COMBO
       f"min_coverage={min(_coverage.values())}, max_coverage={max(_coverage.values())}")
 assert all(v >= 1 for v in _coverage.values()), \
     f"등장 0회 마스크: {[k for k, v in _coverage.items() if v == 0]}"
+assert len(FEAT_COLS) == 348, f"expected 348, got {len(FEAT_COLS)}"
+
+# LSTM 전용 설정
+
+LSTM_SAMPLE_STRIDE = 3
+
+LSTM_FEAT_COLS = [
+    "scale_search", "scale_click", "scale_blog", "scale_insta", "scale_total",
+    "vol_search", "vol_click", "vol_blog", "vol_insta",
+    "click_search_ratio", "social_search_ratio", "blog_insta_ratio", "active_channels",
+    "month_sin", "month_cos",
+    "total_trend", "recent_accel", "peak_recency", "activity_ratio",
+]
+
+LSTM_LABEL_COLS = [
+    "fw_magnitude_5d", "fw_magnitude_10d", "fw_magnitude_15d",
+    "fw_growth_10d", "fw_growth_15d",
+    "fw_peak_pos_10d", "fw_peak_pos_15d",
+    "fw_spike_10d", "fw_spike_15d",
+    "fw_cv_10d", "fw_cv_15d",
+    "fw_decline_10d", "fw_decline_15d",
+]
