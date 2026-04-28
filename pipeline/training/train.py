@@ -21,7 +21,7 @@ from sklearn.model_selection import train_test_split
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from pipeline.config import (
-    ROOT, FEAT_COLS, MASK_REGISTRY,
+    ROOT, FEAT_COLS, MASK_REGISTRY, MASK_COMBOS,
     DATE_COL, TRAIN_RATIO, VALID_RATIO, GAP_DAYS,
     TARGET_CONFIG, DEFAULT_PARAMS, SEARCH_SPACE,
 )
@@ -30,10 +30,13 @@ from pipeline.training.data_loader import load_csv
 warnings.filterwarnings("ignore")
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-def _make_run_dir(target: str = ""):
+def _make_run_dir(target: str = "", combo_label: str = ""):
     from datetime import datetime
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run = os.path.join(str(ROOT), "outputs", f"run_{stamp}_{target}" if target else f"run_{stamp}")
+    suffix = f"_{target}" if target else ""
+    if combo_label:
+        suffix += f"_{combo_label}"
+    run = os.path.join(str(ROOT), "outputs", f"run_{stamp}{suffix}")
     dirs = {
         "figures": os.path.join(run, "figures"),
         "metrics": os.path.join(run, "metrics"),
@@ -453,10 +456,20 @@ def run_hurdle(
 
 
 # 메인 — CSV 로드 → 분할 → 타겟별 학습 실행
-def main(csv_path: str, target: str, do_tune: bool, n_trials: int, train_stride: int = 3, mask_names: list = None, hurdle: float = None):
-    dirs = _make_run_dir(target)
+def main(csv_path: str, target: str, do_tune: bool, n_trials: int, train_stride: int = 3, mask_names: list = None, hurdle: float = None, combo: str = None):
+    # combo 우선 — MASK_COMBOS에서 사전 정의 조합 호출, mask_names 덮어쓰기
+    combo_label = "baseline"
+    if combo is not None:
+        if combo not in MASK_COMBOS:
+            raise ValueError(f"unknown combo: {combo}. 사용 가능: {list(MASK_COMBOS.keys())[:5]}...")
+        mask_names = MASK_COMBOS[combo] or None
+        combo_label = combo
+    elif mask_names:
+        combo_label = "mask_" + "_".join(sorted(mask_names))
+
+    dirs = _make_run_dir(target, combo_label)
     print(f"output → {os.path.dirname(dirs['figures'])}")
-    print(f"target: {target}")
+    print(f"target: {target}  combo: {combo_label}")
 
     df = load_csv(csv_path)
     print(f"shape: {df.shape}")
@@ -580,6 +593,10 @@ if __name__ == "__main__":
         help="피처 마스크 적용 (momentum, buzz, noise, dead, wave, surge 조합 가능)",
     )
     parser.add_argument(
+        "--combo", type=str, default=None,
+        help="MASK_COMBOS 사전 정의 조합 이름 (예: S_buzz, D_buzz_noise, baseline)",
+    )
+    parser.add_argument(
         "--hurdle", type=float, default=None,
         help="Hurdle 모델 활성화, 값은 발생 판정 threshold (예: --hurdle 0.1)",
     )
@@ -597,5 +614,5 @@ if __name__ == "__main__":
     ]
     targets = ALL_TARGETS if args.target == "all" else [args.target]
     for t in targets:
-        main(args.data, t, args.tune, args.n_trials, args.train_stride, args.mask, args.hurdle)
+        main(args.data, t, args.tune, args.n_trials, args.train_stride, args.mask, args.hurdle, args.combo)
 

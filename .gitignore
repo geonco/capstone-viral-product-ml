@@ -25,3 +25,6 @@ experiments
 
 # 로컬 데이터
 modeling/data/
+
+# 개인 작업 폴더
+dhsong/
