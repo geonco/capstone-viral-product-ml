@@ -514,7 +514,7 @@ print(f"[config] MASK_REGISTRY={len(MASK_REGISTRY)}, MASK_COMBOS={len(MASK_COMBO
       f"min_coverage={min(_coverage.values())}, max_coverage={max(_coverage.values())}")
 assert all(v >= 1 for v in _coverage.values()), \
     f"등장 0회 마스크: {[k for k, v in _coverage.items() if v == 0]}"
-assert len(FEAT_COLS) == 348, f"expected 348, got {len(FEAT_COLS)}"
+assert len(FEAT_COLS) == 313, f"expected 313, got {len(FEAT_COLS)}"
 
 # LSTM 전용 설정
 
@@ -526,13 +526,30 @@ LSTM_FEAT_COLS = [
     "click_search_ratio", "social_search_ratio", "blog_insta_ratio", "active_channels",
     "month_sin", "month_cos",
     "total_trend", "recent_accel", "peak_recency", "activity_ratio",
+    # 추가 — 절대 규모 로그, 채널 우세도, 최근 max 위치, lb 내 peak/avg, 활성도 가속
+    "log_scale_total", "channel_dominance", "recent_max_recency",
+    "peak_to_avg", "activity_accel",
 ]
+
+# LSTM 입력 시퀀스 채널 — 4채널 z-score + 합산 log1p z-score + 합산 daily_return
+LSTM_INPUT_CHANNELS = 6
 
 LSTM_LABEL_COLS = [
     "fw_magnitude_5d", "fw_magnitude_10d", "fw_magnitude_15d",
-    "fw_growth_10d", "fw_growth_15d",
-    "fw_peak_pos_10d", "fw_peak_pos_15d",
+    "fw_log_growth_10d", "fw_log_growth_15d",
+    "fw_peak_softpos_10d", "fw_peak_softpos_15d",
     "fw_spike_10d", "fw_spike_15d",
     "fw_cv_10d", "fw_cv_15d",
     "fw_decline_10d", "fw_decline_15d",
+    "fw_delta_10d", "fw_delta_15d",
 ]
+
+# 라벨 그룹 — 분리 head + uncertainty weighting 용
+LSTM_LABEL_GROUPS = {
+    "magnitude":     ["fw_magnitude_5d", "fw_magnitude_10d", "fw_magnitude_15d"],
+    "log_growth":    ["fw_log_growth_10d", "fw_log_growth_15d"],
+    "peak_softpos":  ["fw_peak_softpos_10d", "fw_peak_softpos_15d"],
+    "spike":         ["fw_spike_10d", "fw_spike_15d"],
+    "cv":            ["fw_cv_10d", "fw_cv_15d"],
+    "decline_delta": ["fw_decline_10d", "fw_decline_15d", "fw_delta_10d", "fw_delta_15d"],
+}
