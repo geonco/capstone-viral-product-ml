@@ -23,6 +23,9 @@ outputs/
 # 실험용
 experiments
 
+# 논문 작업
+THESIS/
+
 # 로컬 데이터
 modeling/data/
 

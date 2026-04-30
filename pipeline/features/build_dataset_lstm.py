@@ -12,7 +12,7 @@ from multiprocessing import Pool, cpu_count
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 from pipeline.config import (
     ROOT, START, END, LB, FW, EPS,
-    LSTM_SAMPLE_STRIDE, LSTM_LABEL_COLS, LSTM_FEAT_COLS,
+    LSTM_SAMPLE_STRIDE, LSTM_LABEL_COLS, LSTM_FEAT_COLS, LSTM_INPUT_CHANNELS,
 )
 from pipeline.features.build_dataset import load_all, _build_signals
 
@@ -25,7 +25,7 @@ OUT_SEQ_Y  = OUT_DIR / "lstm_seq_y.npy"
 OUT_META   = OUT_DIR / "lstm_meta.csv"
 
 
-# 13개 라벨 생성 — forward window 정보 기반, lookback 참조 최소화
+# 15개 라벨 생성 — forward window 정보 기반, lookback 참조 최소화
 def compute_lstm_labels(combined_fw, combined_lb):
     mean_lb = float(np.mean(combined_lb)) + EPS
     labels = {}
@@ -35,29 +35,42 @@ def compute_lstm_labels(combined_fw, combined_lb):
     labels["fw_magnitude_10d"] = float(np.log1p(np.mean(combined_fw[:10])))
     labels["fw_magnitude_15d"] = float(np.log1p(np.mean(combined_fw[:15])))
 
-    # 성장 — 과거 평균 대비 미래 평균 비율
-    labels["fw_growth_10d"] = float(np.clip(np.mean(combined_fw[:10]) / mean_lb, 0, 50))
-    labels["fw_growth_15d"] = float(np.clip(np.mean(combined_fw[:15]) / mean_lb, 0, 50))
+    # 로그 성장 — 과거 평균 대비 미래 평균의 log 비율 (대칭 분포)
+    fw_mean_10 = float(np.mean(combined_fw[:10])) + EPS
+    fw_mean_15 = float(np.mean(combined_fw[:15])) + EPS
+    labels["fw_log_growth_10d"] = float(np.clip(np.log(fw_mean_10 / mean_lb), -3.0, 5.0))
+    labels["fw_log_growth_15d"] = float(np.clip(np.log(fw_mean_15 / mean_lb), -3.0, 5.0))
 
-    # 피크 위치 — forward window 내 최고점 위치 (0=초반, 1=후반)
-    labels["fw_peak_pos_10d"] = float(np.argmax(combined_fw[:10])) / 9.0
-    labels["fw_peak_pos_15d"] = float(np.argmax(combined_fw[:15])) / 14.0
+    # 소프트 피크 위치 — magnitude 가중 평균 인덱스 (0=초반, 1=후반)
+    # argmax보다 부드러워 학습 신호가 살아남
+    fw10 = combined_fw[:10].astype(np.float64)
+    fw15 = combined_fw[:15].astype(np.float64)
+    w10  = np.clip(fw10, 0.0, None)
+    w15  = np.clip(fw15, 0.0, None)
+    s10  = float(np.sum(w10)) + EPS
+    s15  = float(np.sum(w15)) + EPS
+    labels["fw_peak_softpos_10d"] = float(np.sum(np.arange(10) * w10) / s10) / 9.0
+    labels["fw_peak_softpos_15d"] = float(np.sum(np.arange(15) * w15) / s15) / 14.0
 
     # 스파이크 강도 — 최고점이 평균 대비 얼마나 뾰족한가
-    mean_10 = float(np.mean(combined_fw[:10])) + EPS
-    mean_15 = float(np.mean(combined_fw[:15])) + EPS
-    labels["fw_spike_10d"] = float(np.clip(np.max(combined_fw[:10]) / mean_10, 1, 50))
-    labels["fw_spike_15d"] = float(np.clip(np.max(combined_fw[:15]) / mean_15, 1, 50))
+    labels["fw_spike_10d"] = float(np.clip(np.max(fw10) / fw_mean_10, 1, 50))
+    labels["fw_spike_15d"] = float(np.clip(np.max(fw15) / fw_mean_15, 1, 50))
 
     # 변동성 — forward window 내 변동계수
-    labels["fw_cv_10d"] = float(np.clip(np.std(combined_fw[:10]) / mean_10, 0, 10))
-    labels["fw_cv_15d"] = float(np.clip(np.std(combined_fw[:15]) / mean_15, 0, 10))
+    labels["fw_cv_10d"] = float(np.clip(np.std(fw10) / fw_mean_10, 0, 10))
+    labels["fw_cv_15d"] = float(np.clip(np.std(fw15) / fw_mean_15, 0, 10))
 
     # 하락 — 피크 대비 마지막 날의 하락률
-    max_10 = float(np.max(combined_fw[:10])) + EPS
-    max_15 = float(np.max(combined_fw[:15])) + EPS
+    max_10 = float(np.max(fw10)) + EPS
+    max_15 = float(np.max(fw15)) + EPS
     labels["fw_decline_10d"] = float(np.clip((max_10 - float(combined_fw[9]))  / max_10, 0, 1))
     labels["fw_decline_15d"] = float(np.clip((max_15 - float(combined_fw[14])) / max_15, 0, 1))
+
+    # 차분 — 미래 평균과 과거 평균의 절대 차이 (log 스케일, 부호 보존)
+    delta_10 = fw_mean_10 - mean_lb
+    delta_15 = fw_mean_15 - mean_lb
+    labels["fw_delta_10d"] = float(np.sign(delta_10) * np.log1p(abs(delta_10)))
+    labels["fw_delta_15d"] = float(np.sign(delta_15) * np.log1p(abs(delta_15)))
 
     return labels
 
@@ -101,6 +114,19 @@ def compute_lstm_features(s_lb, c_lb, b_lb, i_lb, month):
     f["peak_recency"]   = float(np.argmax(combined_lb)) / (LB - 1)
     f["activity_ratio"] = float(np.sum(s_lb > 0)) / LB
 
+    # 추가 — 절대 규모 비선형, 채널 우세, 최근 max 위치, 과거 뾰족함, 활성도 가속
+    f["log_scale_total"] = float(np.log1p(f["scale_total"]))
+    channel_means = np.array([
+        f["scale_search"], f["scale_click"], f["scale_blog"], f["scale_insta"]
+    ])
+    f["channel_dominance"] = float(channel_means.max() / (channel_means.sum() + EPS))
+    recent30 = combined_lb[-30:]
+    f["recent_max_recency"] = float(np.argmax(recent30)) / 29.0
+    mean_lb = float(np.mean(combined_lb)) + EPS
+    f["peak_to_avg"] = float(np.max(combined_lb) / mean_lb)
+    act_recent = float(np.sum(s_lb[-14:] > 0)) / 14.0
+    f["activity_accel"] = act_recent - f["activity_ratio"]
+
     return f
 
 
@@ -135,13 +161,27 @@ def _process_keyword(args):
         b_lb = blog_arr[lo:ti]
         i_lb = insta_arr[lo:ti]
 
-        # 입력 시퀀스 — 채널별 z-score 정규화
+        # 입력 시퀀스 — 6채널
+        # ch0~3: 원본 4채널 z-score
+        # ch4  : 합산 log1p z-score (절대 규모 비선형 표현)
+        # ch5  : 합산 daily_return (전일 대비 변화율)
         channels = [s_lb, c_lb, b_lb, i_lb]
-        seq = np.zeros((LB, 4), dtype=np.float32)
+        seq = np.zeros((LB, LSTM_INPUT_CHANNELS), dtype=np.float32)
         for ch_idx, ch in enumerate(channels):
             ch_mean = float(np.mean(ch))
             ch_std  = float(np.std(ch)) + EPS
             seq[:, ch_idx] = ((ch - ch_mean) / ch_std).astype(np.float32)
+
+        combined_lb_seq = s_lb + c_lb + b_lb + i_lb
+        log_combined    = np.log1p(np.clip(combined_lb_seq, 0.0, None))
+        lc_mean = float(np.mean(log_combined))
+        lc_std  = float(np.std(log_combined)) + EPS
+        seq[:, 4] = ((log_combined - lc_mean) / lc_std).astype(np.float32)
+
+        prev = np.concatenate([[combined_lb_seq[0]], combined_lb_seq[:-1]])
+        daily_ret = (combined_lb_seq - prev) / (np.abs(prev) + EPS)
+        daily_ret = np.clip(daily_ret, -5.0, 5.0)
+        seq[:, 5] = daily_ret.astype(np.float32)
 
         # 보조 피처
         month = dates[ti].month
