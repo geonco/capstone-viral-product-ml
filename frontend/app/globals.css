@@ -1,0 +1,40 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body { background: #0b0d12; color: #e5e7eb; }
+body { font-feature-settings: "ss01", "cv11"; }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: #222734; border-radius: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+.card {
+  background: linear-gradient(180deg, rgba(22,26,35,1) 0%, rgba(17,20,27,1) 100%);
+  border: 1px solid #222734;
+  border-radius: 14px;
+}
+.chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 8px; border-radius: 999px;
+  font-size: 11px; font-weight: 600;
+  background: rgba(124,92,255,.12); color: #c4b5fd;
+  border: 1px solid rgba(124,92,255,.25);
+}
+.chip-good { background: rgba(52,211,153,.10); color: #6ee7b7; border-color: rgba(52,211,153,.3); }
+.chip-bad  { background: rgba(248,113,113,.10); color: #fca5a5; border-color: rgba(248,113,113,.3); }
+.chip-warn { background: rgba(251,191,36,.10); color: #fcd34d; border-color: rgba(251,191,36,.3); }
+
+.btn {
+  padding: 8px 14px; border-radius: 10px;
+  border: 1px solid #222734;
+  background: #161a23; color: #e5e7eb;
+  font-size: 13px; font-weight: 500;
+  transition: 120ms;
+}
+.btn:hover { background: #1c2130; border-color: #2c3344; }
+.btn-primary {
+  background: linear-gradient(180deg, #8b6dff 0%, #6f4eff 100%);
+  border: none; color: white;
+}
+.btn-primary:hover { filter: brightness(1.1); }
