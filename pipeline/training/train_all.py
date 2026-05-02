@@ -57,8 +57,8 @@ BUCKET_REG_OVERRIDE = {
 # extreme 구간(양 끝) 샘플 가중치 — 소수 클래스 학습 보완
 EXTREME_WEIGHT = 2.0
 
-DEFAULT_CLF_PARAMS_3 = {
-    "boosting_type": "gbdt", "objective": "multiclass", "num_class": 3,
+DEFAULT_CLF_PARAMS = {
+    "boosting_type": "gbdt", "objective": "multiclass",
     "n_estimators": 1000, "learning_rate": 0.05, "num_leaves": 64, "max_depth": -1,
     "min_child_samples": 200, "subsample": 0.8, "colsample_bytree": 0.8,
     "reg_alpha": 0.1, "reg_lambda": 0.1, "random_state": 42, "n_jobs": -1, "verbose": -1,
@@ -93,15 +93,8 @@ def _family(target):
 
 
 def make_bucket(y, thresholds):
-    # 원본 스케일 경계 기준 구간 레이블 산출 — thresholds 길이에 따라 2/3/4구간 지원
-    y = np.asarray(y)
-    if len(thresholds) == 1:
-        return np.where(y <= thresholds[0], 0, 1)
-    if len(thresholds) == 2:
-        t1, t2 = thresholds
-        return np.where(y <= t1, 0, np.where(y <= t2, 1, 2))
-    t1, t2, t3 = thresholds[0], thresholds[1], thresholds[2]
-    return np.where(y <= t1, 0, np.where(y <= t2, 1, np.where(y <= t3, 2, 3)))
+    # 원본 스케일 경계 기준 구간 레이블 산출 — right=True로 경계값은 하위 구간에 포함
+    return np.digitize(np.asarray(y), thresholds, right=True)
 
 
 def make_weight(buckets, n_class):
@@ -142,7 +135,7 @@ def split_data(df, train_stride=1):
     remaining = dates[dates >= valid_start]
     if len(remaining) == 0:
         raise ValueError("gap 적용 후 valid/test 데이터 없음")
-    valid_end  = remaining[int(len(remaining) * 0.5)]
+    valid_end  = remaining[int(len(remaining) * VALID_RATIO / (1 - TRAIN_RATIO))]
     test_start = valid_end + pd.Timedelta(days=GAP_DAYS)
 
     train = df[df[DATE_COL] <= train_end]
@@ -267,7 +260,7 @@ def run_staged(X_tr, y_tr, X_va, y_va, X_te, y_te, target, dirs, do_tune, n_tria
 
     # STEP 1 — 분류기 학습
     print("\n  [STEP 1] Classifier")
-    clf_params = {**DEFAULT_CLF_PARAMS_3, "num_class": n_class}
+    clf_params = {**DEFAULT_CLF_PARAMS, "num_class": n_class}
     if do_tune:
         clf_params = _tune(X_tr, b_tr, X_va, b_va, clf_params, n_trials, dirs, w_tr, label=f"{target}_clf")
 
@@ -304,9 +297,9 @@ def run_staged(X_tr, y_tr, X_va, y_va, X_te, y_te, target, dirs, do_tune, n_tria
             xv_b = X_tr[mask_tr].iloc[:k]
             yv_b = y_tr_b[:k]
 
-        override    = BUCKET_REG_OVERRIDE.get((fam, name), {})
-        alphas      = override.pop("alphas", None) if isinstance(override, dict) else None
-        override    = {k: v for k, v in BUCKET_REG_OVERRIDE.get((fam, name), {}).items() if k != "alphas"}
+        raw_override = BUCKET_REG_OVERRIDE.get((fam, name), {})
+        alphas       = raw_override.get("alphas", None)
+        override     = {k: v for k, v in raw_override.items() if k != "alphas"}
         reg_params  = {**DEFAULT_REG_PARAMS, **override}
 
         if alphas:
