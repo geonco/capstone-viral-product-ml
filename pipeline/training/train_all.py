@@ -33,7 +33,7 @@ TARGET_STRATEGY = {
     "intensity_5d":       "staged3", "intensity_10d":       "staged3", "intensity_15d":       "staged3",
     "growth_5d":          "staged3", "growth_10d":          "staged3", "growth_15d":          "staged3",
     "crash_5d":           "single",  "crash_10d":           "single",  "crash_15d":           "single",
-    "buzz_composite_5d":  "single",  "buzz_composite_10d":  "single",  "buzz_composite_15d":  "single",
+    "buzz_composite_5d":  "staged3", "buzz_composite_10d":  "staged3", "buzz_composite_15d":  "staged3",
     "sustainability_5d":  "single",  "sustainability_10d":  "single",  "sustainability_15d":  "single",
 }
 
@@ -41,24 +41,33 @@ TARGET_STRATEGY = {
 BUCKET_CONFIG = {
     "intensity":     {"thresholds": [569.0, 800.0],       "names": ["low",    "mid",    "high"],                  "log": True,  "n_class": 3},
     "growth":        {"thresholds": [0.90,  1.56,  5.0],  "names": ["shrink", "stable", "surge", "extreme"],      "log": True,  "n_class": 4},
-    "buzz_composite":{"thresholds": [-0.46, 1.02],        "names": ["negative", "neutral", "positive"],           "log": False, "n_class": 3},
+    "buzz_composite":{"thresholds": [-0.50, 0.80],        "names": ["negative", "neutral", "positive"],           "log": False, "n_class": 3},
 }
 
 # 구간별 회귀 파라미터 override — 패밀리+구간명 키로 DEFAULT_REG_PARAMS 일부를 덮어씀
 # alphas 키가 있으면 해당 alpha 목록으로 quantile 앙상블 학습
 BUCKET_REG_OVERRIDE = {
-    ("intensity", "high"):   {"num_leaves": 32, "min_child_samples": 50},
-    ("growth", "shrink"):    {"num_leaves": 32, "min_child_samples": 30},
-    ("growth", "stable"):    {"num_leaves": 32, "min_child_samples": 30},
-    ("growth", "surge"):     {"objective": "quantile", "num_leaves": 64, "min_child_samples": 20, "alphas": [0.75, 0.90]},
-    ("growth", "extreme"):   {"objective": "quantile", "num_leaves": 16, "min_child_samples": 10, "alphas": [0.75, 0.90]},
+    ("intensity", "high"):         {"num_leaves": 32, "min_child_samples": 50},
+    ("growth", "shrink"):          {"num_leaves": 32, "min_child_samples": 30},
+    ("growth", "stable"):          {"num_leaves": 32, "min_child_samples": 30},
+    ("growth", "surge"):           {"objective": "quantile", "num_leaves": 64, "min_child_samples": 20, "alphas": [0.75, 0.90]},
+    ("growth", "extreme"):         {"objective": "quantile", "num_leaves": 16, "min_child_samples": 10, "alphas": [0.75, 0.90]},
+}
+
+# 구간별 Optuna 탐색 범위 — (nl_low, nl_high, md_low, md_high)
+# 미정의 구간은 기본값(15, 127, 4, 10) 사용
+TUNE_SEARCH_SPACE = {
+    ("buzz_composite", "clf"):      (31, 127, 4, 10),
+    ("buzz_composite", "negative"): (15,  63, 4,  8),
+    ("buzz_composite", "neutral"):  (31, 127, 4, 10),
+    ("buzz_composite", "positive"): (15,  47, 4,  8),
 }
 
 # extreme 구간(양 끝) 샘플 가중치 — 소수 클래스 학습 보완
 EXTREME_WEIGHT = 2.0
 
-DEFAULT_CLF_PARAMS_3 = {
-    "boosting_type": "gbdt", "objective": "multiclass", "num_class": 3,
+DEFAULT_CLF_PARAMS = {
+    "boosting_type": "gbdt", "objective": "multiclass",
     "n_estimators": 1000, "learning_rate": 0.05, "num_leaves": 64, "max_depth": -1,
     "min_child_samples": 200, "subsample": 0.8, "colsample_bytree": 0.8,
     "reg_alpha": 0.1, "reg_lambda": 0.1, "random_state": 42, "n_jobs": -1, "verbose": -1,
@@ -93,15 +102,8 @@ def _family(target):
 
 
 def make_bucket(y, thresholds):
-    # 원본 스케일 경계 기준 구간 레이블 산출 — thresholds 길이에 따라 2/3/4구간 지원
-    y = np.asarray(y)
-    if len(thresholds) == 1:
-        return np.where(y <= thresholds[0], 0, 1)
-    if len(thresholds) == 2:
-        t1, t2 = thresholds
-        return np.where(y <= t1, 0, np.where(y <= t2, 1, 2))
-    t1, t2, t3 = thresholds[0], thresholds[1], thresholds[2]
-    return np.where(y <= t1, 0, np.where(y <= t2, 1, np.where(y <= t3, 2, 3)))
+    # 원본 스케일 경계 기준 구간 레이블 산출 — right=True로 경계값은 하위 구간에 포함
+    return np.digitize(np.asarray(y), thresholds, right=True)
 
 
 def make_weight(buckets, n_class):
@@ -142,7 +144,7 @@ def split_data(df, train_stride=1):
     remaining = dates[dates >= valid_start]
     if len(remaining) == 0:
         raise ValueError("gap 적용 후 valid/test 데이터 없음")
-    valid_end  = remaining[int(len(remaining) * 0.5)]
+    valid_end  = remaining[int(len(remaining) * VALID_RATIO / (1 - TRAIN_RATIO))]
     test_start = valid_end + pd.Timedelta(days=GAP_DAYS)
 
     train = df[df[DATE_COL] <= train_end]
@@ -161,7 +163,8 @@ def split_data(df, train_stride=1):
     return train, valid, test
 
 
-def _run_study(X_tr, y_tr, X_va, y_va, fixed, n_trials, w_tr, is_clf, label, dirs):
+def _run_study(X_tr, y_tr, X_va, y_va, fixed, n_trials, w_tr, is_clf, label, dirs,
+               nl_low=15, nl_high=127, md_low=4, md_high=10):
     # Optuna study — num_leaves/max_depth 탐색, trial별 best_iteration·과적합 기록
     trial_records = []
 
@@ -169,8 +172,8 @@ def _run_study(X_tr, y_tr, X_va, y_va, fixed, n_trials, w_tr, is_clf, label, dir
         params = {
             **fixed,
             "n_estimators": 500,
-            "num_leaves": trial.suggest_int("num_leaves", 15, 127),
-            "max_depth":  trial.suggest_int("max_depth",   4,  10),
+            "num_leaves": trial.suggest_int("num_leaves", nl_low, nl_high),
+            "max_depth":  trial.suggest_int("max_depth",  md_low, md_high),
         }
         m = lgb.LGBMClassifier(**params) if is_clf else lgb.LGBMRegressor(**params)
         m.fit(X_tr, y_tr, sample_weight=w_tr, eval_set=[(X_va, y_va)],
@@ -206,13 +209,15 @@ def _run_study(X_tr, y_tr, X_va, y_va, fixed, n_trials, w_tr, is_clf, label, dir
     return study.best_params, study.best_value
 
 
-def _tune(X_tr, y_tr, X_va, y_va, fixed, n_trials, dirs, w_tr=None, label=""):
+def _tune(X_tr, y_tr, X_va, y_va, fixed, n_trials, dirs, w_tr=None, label="",
+          nl_low=15, nl_high=127, md_low=4, md_high=10):
     # num_leaves / max_depth Optuna 탐색 — learning_rate는 DEFAULT_PARAMS에서 수동 설정
     is_clf = fixed.get("objective") in ("multiclass", "binary")
     lr     = fixed.get("learning_rate", 0.05)
-    print(f"    [tune] {label}  lr={lr}  trials={n_trials}")
+    print(f"    [tune] {label}  lr={lr}  trials={n_trials}  nl=[{nl_low},{nl_high}]  md=[{md_low},{md_high}]")
 
-    best, val = _run_study(X_tr, y_tr, X_va, y_va, fixed, n_trials, w_tr, is_clf, label, dirs)
+    best, val = _run_study(X_tr, y_tr, X_va, y_va, fixed, n_trials, w_tr, is_clf, label, dirs,
+                           nl_low=nl_low, nl_high=nl_high, md_low=md_low, md_high=md_high)
     print(f"      best: {val:.4f}  {best}")
 
     return {**fixed, **best}
@@ -240,7 +245,7 @@ def _shap_save(model, X, label, dirs):
 def _evaluate(y_true, y_pred, split, target):
     mae  = float(mean_absolute_error(y_true, y_pred))
     rmse = rmse_score(y_true, y_pred)
-    print(f"  [{split:5s}] MAE={mae:.4f}  RMSE={rmse:.4f}")
+    print(f"  [{split}] MAE={mae:.4f}  RMSE={rmse:.4f}")
     return {"target": target, "split": split, "mae": mae, "rmse": rmse, "n": len(y_true)}
 
 
@@ -267,9 +272,12 @@ def run_staged(X_tr, y_tr, X_va, y_va, X_te, y_te, target, dirs, do_tune, n_tria
 
     # STEP 1 — 분류기 학습
     print("\n  [STEP 1] Classifier")
-    clf_params = {**DEFAULT_CLF_PARAMS_3, "num_class": n_class}
+    clf_params = {**DEFAULT_CLF_PARAMS, "num_class": n_class}
     if do_tune:
-        clf_params = _tune(X_tr, b_tr, X_va, b_va, clf_params, n_trials, dirs, w_tr, label=f"{target}_clf")
+        nl_low, nl_high, md_low, md_high = TUNE_SEARCH_SPACE.get((fam, "clf"), (15, 127, 4, 10))
+        clf_params = _tune(X_tr, b_tr, X_va, b_va, clf_params, n_trials, dirs, w_tr,
+                           label=f"{target}_clf", nl_low=nl_low, nl_high=nl_high,
+                           md_low=md_low, md_high=md_high)
 
     clf = lgb.LGBMClassifier(**clf_params)
     clf.fit(X_tr, b_tr, sample_weight=w_tr, eval_set=[(X_va, b_va)],
@@ -304,9 +312,9 @@ def run_staged(X_tr, y_tr, X_va, y_va, X_te, y_te, target, dirs, do_tune, n_tria
             xv_b = X_tr[mask_tr].iloc[:k]
             yv_b = y_tr_b[:k]
 
-        override    = BUCKET_REG_OVERRIDE.get((fam, name), {})
-        alphas      = override.pop("alphas", None) if isinstance(override, dict) else None
-        override    = {k: v for k, v in BUCKET_REG_OVERRIDE.get((fam, name), {}).items() if k != "alphas"}
+        raw_override = BUCKET_REG_OVERRIDE.get((fam, name), {})
+        alphas       = raw_override.get("alphas", None)
+        override     = {k: v for k, v in raw_override.items() if k != "alphas"}
         reg_params  = {**DEFAULT_REG_PARAMS, **override}
 
         if alphas:
@@ -325,8 +333,10 @@ def run_staged(X_tr, y_tr, X_va, y_va, X_te, y_te, target, dirs, do_tune, n_tria
             _shap_save(regs[0], shap_X, f"{target}_reg_{name}", dirs)
         else:
             if do_tune:
+                nl_low, nl_high, md_low, md_high = TUNE_SEARCH_SPACE.get((fam, name), (15, 127, 4, 10))
                 reg_params = _tune(X_tr[mask_tr], y_tr_b, xv_b, yv_b,
-                                   reg_params, n_trials, dirs, label=f"{target}_reg_{name}")
+                                   reg_params, n_trials, dirs, label=f"{target}_reg_{name}",
+                                   nl_low=nl_low, nl_high=nl_high, md_low=md_low, md_high=md_high)
             reg = lgb.LGBMRegressor(**reg_params)
             reg.fit(X_tr[mask_tr], y_tr_b, eval_set=[(xv_b, yv_b)],
                     callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(-1)])
