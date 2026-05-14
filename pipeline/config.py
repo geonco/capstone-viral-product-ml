@@ -70,9 +70,9 @@ TARGET_CONFIG = {
     "growth_5d":           {"log": True},
     "growth_10d":          {"log": True},
     "growth_15d":          {"log": True},
-    "sustainability_5d":   {"log": False},
-    "sustainability_10d":  {"log": False},
-    "sustainability_15d":  {"log": False},
+    "sustainability_5d":   {"log": True},
+    "sustainability_10d":  {"log": True},
+    "sustainability_15d":  {"log": True},
     "crash_5d":            {"log": False},
     "crash_10d":           {"log": False},
     "crash_15d":           {"log": False},
@@ -279,6 +279,9 @@ for _n in [1, 3, 7, 14, 30]:
     _multi.append(f"past_buzz_zscore_{_n}d")
 _multi.append("conv_trend")
 FEAT_COLS += [c for c in _multi if c not in CLUSTER_DROP]
+
+# buzz 임계값 근접도 / 속도 — neutral↔positive 경계 구분 보조
+FEAT_COLS += ["buzz_dist_to_threshold", "buzz_velocity_short", "buzz_velocity_mid"]
 
 # 캘린더 — month는 PSI=7.92로 제거, sin/cos circular encoding으로 대체
 FEAT_COLS += ["month_sin", "month_cos"]
@@ -514,7 +517,7 @@ print(f"[config] MASK_REGISTRY={len(MASK_REGISTRY)}, MASK_COMBOS={len(MASK_COMBO
       f"min_coverage={min(_coverage.values())}, max_coverage={max(_coverage.values())}")
 assert all(v >= 1 for v in _coverage.values()), \
     f"등장 0회 마스크: {[k for k, v in _coverage.items() if v == 0]}"
-assert len(FEAT_COLS) == 313, f"expected 313, got {len(FEAT_COLS)}"
+assert len(FEAT_COLS) == 316, f"expected 316, got {len(FEAT_COLS)}"
 
 # LSTM 전용 설정
 

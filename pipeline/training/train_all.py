@@ -39,9 +39,10 @@ TARGET_STRATEGY = {
 
 # 구간 설정 — 패밀리별 경계(원본 스케일), 구간명, 회귀 시 log1p 여부
 BUCKET_CONFIG = {
-    "intensity":     {"thresholds": [569.0, 800.0],       "names": ["low",    "mid",    "high"],                  "log": True,  "n_class": 3},
-    "growth":        {"thresholds": [0.90,  1.56,  5.0],  "names": ["shrink", "stable", "surge", "extreme"],      "log": True,  "n_class": 4},
-    "buzz_composite":{"thresholds": [-0.50, 0.80],        "names": ["negative", "neutral", "positive"],           "log": False, "n_class": 3},
+    "intensity":     {"thresholds": [569.0, 800.0],       "names": ["low",    "mid",    "high"],                  "log": True,  "n_class": 3, "hard": False},
+    "growth":        {"thresholds": [0.90,  1.56,  5.0],  "names": ["shrink", "stable", "surge", "extreme"],      "log": True,  "n_class": 4, "hard": False},
+    "buzz_composite":  {"thresholds": [-0.50, 0.80],        "names": ["negative", "neutral", "positive"],           "log": False, "n_class": 3, "hard": True},
+    "sustainability":  {"thresholds": [0.80,  1.20],        "names": ["declining", "stable",   "sustained"],        "log": True,  "n_class": 3, "hard": False},
 }
 
 # 구간별 회귀 파라미터 override — 패밀리+구간명 키로 DEFAULT_REG_PARAMS 일부를 덮어씀
@@ -52,6 +53,7 @@ BUCKET_REG_OVERRIDE = {
     ("growth", "stable"):          {"num_leaves": 32, "min_child_samples": 30},
     ("growth", "surge"):           {"objective": "quantile", "num_leaves": 64, "min_child_samples": 20, "alphas": [0.75, 0.90]},
     ("growth", "extreme"):         {"objective": "quantile", "num_leaves": 16, "min_child_samples": 10, "alphas": [0.75, 0.90]},
+    ("buzz_composite", "positive"): {"log": True},
 }
 
 # 구간별 Optuna 탐색 범위 — (nl_low, nl_high, md_low, md_high)
@@ -66,9 +68,16 @@ TUNE_SEARCH_SPACE = {
 # extreme 구간(양 끝) 샘플 가중치 — 소수 클래스 학습 보완
 EXTREME_WEIGHT = 2.0
 
+# 타겟별 single 회귀 파라미터 override — DEFAULT_PARAMS 일부를 덮어씀
+SINGLE_PARAMS_OVERRIDE = {
+    "sustainability_5d":  {"learning_rate": 0.01, "n_estimators": 3000, "device_type": "cuda"},
+    "sustainability_10d": {"learning_rate": 0.01, "n_estimators": 3000, "device_type": "cuda"},
+    "sustainability_15d": {"learning_rate": 0.01, "n_estimators": 3000, "device_type": "cuda"},
+}
+
 DEFAULT_CLF_PARAMS = {
     "boosting_type": "gbdt", "objective": "multiclass",
-    "n_estimators": 1000, "learning_rate": 0.05, "num_leaves": 64, "max_depth": -1,
+    "n_estimators": 3000, "learning_rate": 0.01, "num_leaves": 64, "max_depth": -1,
     "min_child_samples": 200, "subsample": 0.8, "colsample_bytree": 0.8,
     "reg_alpha": 0.1, "reg_lambda": 0.1, "random_state": 42, "n_jobs": -1, "verbose": -1,
     "metric": "multi_logloss",
@@ -76,7 +85,7 @@ DEFAULT_CLF_PARAMS = {
 
 DEFAULT_REG_PARAMS = {
     "boosting_type": "gbdt", "objective": "regression",
-    "n_estimators": 1000, "learning_rate": 0.05, "num_leaves": 64, "max_depth": -1,
+    "n_estimators": 3000, "learning_rate": 0.01, "num_leaves": 64, "max_depth": -1,
     "min_child_samples": 200, "subsample": 0.8, "colsample_bytree": 0.8,
     "reg_alpha": 0.1, "reg_lambda": 0.1, "random_state": 42, "n_jobs": -1, "verbose": -1,
 }
@@ -111,22 +120,38 @@ def make_weight(buckets, n_class):
     return np.where((buckets == 0) | (buckets == n_class - 1), EXTREME_WEIGHT, 1.0)
 
 
-def soft_predict(clf, regressors, fallbacks, X, use_log):
-    # clf 확률 가중합으로 최종 예측 — 구간 경계 불연속 완화
+def soft_predict(clf, regressors, fallbacks, X, log_flags, hard=False):
+    # clf 확률 가중합(soft) 또는 argmax 라우팅(hard)으로 최종 예측
+    # log_flags: bucket index → log1p 적용 여부 (per-bucket 독립 적용)
+    # hard=True: 가장 확률 높은 구간 회귀기만 사용 — 타 구간 예측값 오염 차단
     # regressors 값이 list이면 앙상블(평균), 단일 모델이면 그대로 사용
-    proba = clf.predict_proba(X)
-    preds = np.zeros(len(X))
-    for b_idx, model in regressors.items():
+    proba   = clf.predict_proba(X)
+    buckets = np.argmax(proba, axis=1)  # hard routing용 구간 인덱스
+
+    def _reg_pred(b_idx, model):
+        use_log = log_flags.get(b_idx, False)
         if model is None:
-            reg_pred = np.full(len(X), fallbacks[b_idx])
+            return np.full(len(X), fallbacks[b_idx])
         elif isinstance(model, list):
             raw = np.stack([m.predict(X) for m in model], axis=0).mean(axis=0)
-            reg_pred = np.expm1(raw) if use_log else raw
+            return np.expm1(raw) if use_log else raw
         else:
-            reg_pred = model.predict(X)
-            if use_log:
-                reg_pred = np.expm1(reg_pred)
-        preds += proba[:, b_idx] * reg_pred
+            raw = model.predict(X)
+            return np.expm1(raw) if use_log else raw
+
+    if hard:
+        preds = np.zeros(len(X))
+        for b_idx, model in regressors.items():
+            mask = buckets == b_idx
+            if mask.sum() == 0:
+                continue
+            full_pred      = _reg_pred(b_idx, model)
+            preds[mask]    = full_pred[mask]
+        return preds
+
+    preds = np.zeros(len(X))
+    for b_idx, model in regressors.items():
+        preds += proba[:, b_idx] * _reg_pred(b_idx, model)
     return preds
 
 
@@ -256,9 +281,10 @@ def run_staged(X_tr, y_tr, X_va, y_va, X_te, y_te, target, dirs, do_tune, n_tria
     names      = cfg["names"]
     use_log    = cfg["log"]
     n_class    = cfg["n_class"]
+    hard       = cfg.get("hard", False)
 
     print(f"\n{'='*55}")
-    print(f"  [staged] {target}  thresholds={thresholds}  log={use_log}  n_class={n_class}")
+    print(f"  [staged] {target}  thresholds={thresholds}  log={use_log}  n_class={n_class}  hard={hard}")
     print(f"{'='*55}")
 
     b_tr = make_bucket(y_tr, thresholds)
@@ -290,6 +316,7 @@ def run_staged(X_tr, y_tr, X_va, y_va, X_te, y_te, target, dirs, do_tune, n_tria
     print("\n  [STEP 2] Per-bucket Regressors")
     regressors = {}
     fallbacks  = {}
+    log_flags  = {}  # bucket index → log1p 적용 여부 — soft_predict에 전달
 
     for b_idx, name in enumerate(names):
         mask_tr = b_tr == b_idx
@@ -299,23 +326,27 @@ def run_staged(X_tr, y_tr, X_va, y_va, X_te, y_te, target, dirs, do_tune, n_tria
         print(f"\n    [{name}] train={mask_tr.sum()}  valid={mask_va.sum()}")
         if mask_tr.sum() < 10:
             regressors[b_idx] = None
+            log_flags[b_idx]  = use_log
             continue
 
-        y_tr_b = np.log1p(y_tr[mask_tr]) if use_log else y_tr[mask_tr]
+        raw_override = BUCKET_REG_OVERRIDE.get((fam, name), {})
+        alphas       = raw_override.get("alphas", None)
+        # log 키 — 지정 시 해당 구간만 독립 적용, 미지정 시 family 기본값 사용
+        bucket_log   = raw_override.get("log", use_log)
+        override     = {k: v for k, v in raw_override.items() if k not in ("alphas", "log")}
+        reg_params   = {**DEFAULT_REG_PARAMS, **override}
+        log_flags[b_idx] = bucket_log
+
+        y_tr_b = np.log1p(y_tr[mask_tr]) if bucket_log else y_tr[mask_tr]
 
         # valid 샘플 부족 시 train 일부를 대용
         if mask_va.sum() >= 5:
             xv_b = X_va[mask_va]
-            yv_b = np.log1p(y_va[mask_va]) if use_log else y_va[mask_va]
+            yv_b = np.log1p(y_va[mask_va]) if bucket_log else y_va[mask_va]
         else:
             k    = max(1, mask_tr.sum() // 5)
             xv_b = X_tr[mask_tr].iloc[:k]
             yv_b = y_tr_b[:k]
-
-        raw_override = BUCKET_REG_OVERRIDE.get((fam, name), {})
-        alphas       = raw_override.get("alphas", None)
-        override     = {k: v for k, v in raw_override.items() if k != "alphas"}
-        reg_params  = {**DEFAULT_REG_PARAMS, **override}
 
         if alphas:
             # quantile 앙상블 — alpha별 모델 각각 학습 후 리스트로 저장
@@ -350,7 +381,7 @@ def run_staged(X_tr, y_tr, X_va, y_va, X_te, y_te, target, dirs, do_tune, n_tria
     print("\n  [STEP 3] 전체 평가")
     results = []
     for split_name, X, y, b in [("train", X_tr, y_tr, b_tr), ("valid", X_va, y_va, b_va), ("test", X_te, y_te, b_te)]:
-        pred = soft_predict(clf, regressors, fallbacks, X, use_log)
+        pred = soft_predict(clf, regressors, fallbacks, X, log_flags, hard=hard)
         results.append(_evaluate(y, pred, split_name, target))
         # 구간별 MAE
         for b_idx, name in enumerate(names):
@@ -372,7 +403,7 @@ def run_single(X_tr, y_tr, X_va, y_va, X_te, y_te, target, dirs, do_tune, n_tria
     y_tr_t = np.log1p(y_tr) if use_log else y_tr
     y_va_t = np.log1p(y_va) if use_log else y_va
 
-    params = {**DEFAULT_PARAMS}
+    params = {**DEFAULT_PARAMS, **SINGLE_PARAMS_OVERRIDE.get(target, {})}
     if do_tune:
         params = _tune(X_tr, y_tr_t, X_va, y_va_t, params, n_trials, dirs, label=target)
 
