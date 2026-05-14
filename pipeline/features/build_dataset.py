@@ -387,6 +387,12 @@ def cross_feat(sf, cf, pfs, all_lbs):
                 zscore_sum += w * z
         f[f"past_buzz_zscore_{n}d"] = zscore_sum
 
+    # buzz 임계값 근접도 / 속도 — neutral↔positive 경계(0.8) 구분 보조
+    # past_buzz_zscore와 동일 스케일이므로 직접 차감 가능
+    f["buzz_dist_to_threshold"] = f["past_buzz_zscore_1d"] - 0.8
+    f["buzz_velocity_short"]    = f["past_buzz_zscore_1d"] - f["past_buzz_zscore_7d"]
+    f["buzz_velocity_mid"]      = f["past_buzz_zscore_7d"] - f["past_buzz_zscore_30d"]
+
     # conv_trend — 전환율 추세 (최근 3일 vs 14일)
     f["conv_trend"] = f["past_conversion_rate_3d"] - f["past_conversion_rate_14d"]
 

@@ -62,9 +62,9 @@ TARGET_CONFIG = {
     "growth_5d":           {"log": True},
     "growth_10d":          {"log": True},
     "growth_15d":          {"log": True},
-    "sustainability_5d":   {"log": False},
-    "sustainability_10d":  {"log": False},
-    "sustainability_15d":  {"log": False},
+    "sustainability_5d":   {"log": True},
+    "sustainability_10d":  {"log": True},
+    "sustainability_15d":  {"log": True},
     "crash_5d":            {"log": False},
     "crash_10d":           {"log": False},
     "crash_15d":           {"log": False},
@@ -177,6 +177,9 @@ for _n in _W_MULTI:
     FEAT_COLS.append(f"past_buzz_zscore_{_n}d")
 FEAT_COLS += ["conv_trend"]
 
+# buzz 임계값 근접도 / 속도 — neutral↔positive 경계 구분 보조
+FEAT_COLS += ["buzz_dist_to_threshold", "buzz_velocity_short", "buzz_velocity_mid"]
+
 # 캘린더
 FEAT_COLS += ["month"]
 
@@ -194,4 +197,4 @@ ALL_COLS      = META_COLS + FEAT_COLS + LABEL_COLS
 REQUIRED_COLS = FEAT_COLS
 OPTIONAL_COLS = META_COLS + LABEL_COLS
 
-assert len(FEAT_COLS) == 348, f"expected 348, got {len(FEAT_COLS)}"
+assert len(FEAT_COLS) == 351, f"expected 351, got {len(FEAT_COLS)}"
