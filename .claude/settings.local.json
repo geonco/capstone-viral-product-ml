@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(ls C:/capstone-viral-product-ml/outputs/lstm_20260410_160723/*.pt)",
+      "Bash(ls C:/capstone-viral-product-ml/outputs/lstm_seq2seq_20260410_160735/*.pt)",
+      "Bash(tasklist)"
+    ]
+  }
+}
