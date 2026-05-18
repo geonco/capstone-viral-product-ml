@@ -53,7 +53,7 @@ BUCKET_REG_OVERRIDE = {
     ("growth", "stable"):          {"num_leaves": 32, "min_child_samples": 30},
     ("growth", "surge"):           {"objective": "quantile", "num_leaves": 64, "min_child_samples": 20, "alphas": [0.75, 0.90]},
     ("growth", "extreme"):         {"objective": "quantile", "num_leaves": 16, "min_child_samples": 10, "alphas": [0.75, 0.90]},
-    ("buzz_composite", "positive"): {"log": True, "objective": "huber", "alpha": 1.0},
+    ("buzz_composite", "positive"): {"log": True, "objective": "regression_l1"},
 }
 
 # 구간별 Optuna 탐색 범위 — (nl_low, nl_high, md_low, md_high, mc_low, mc_high)
