@@ -41,7 +41,7 @@ TARGET_STRATEGY = {
 BUCKET_CONFIG = {
     "intensity":     {"thresholds": [569.0, 800.0],       "names": ["low",    "mid",    "high"],                  "log": True,  "n_class": 3, "hard": False},
     "growth":        {"thresholds": [0.90,  1.56,  5.0],  "names": ["shrink", "stable", "surge", "extreme"],      "log": True,  "n_class": 4, "hard": False},
-    "buzz_composite":  {"thresholds": [-0.50, 0.80],        "names": ["negative", "neutral", "positive"],           "log": False, "n_class": 3, "hard": True},
+    "buzz_composite":  {"thresholds": [-0.50, 0.80],        "names": ["negative", "neutral", "positive"],           "log": False, "n_class": 3, "hard": False, "hierarchical": True},
     "sustainability":  {"thresholds": [0.80,  1.20],        "names": ["declining", "stable",   "sustained"],        "log": True,  "n_class": 3, "hard": False},
 }
 
@@ -53,20 +53,44 @@ BUCKET_REG_OVERRIDE = {
     ("growth", "stable"):          {"num_leaves": 32, "min_child_samples": 30},
     ("growth", "surge"):           {"objective": "quantile", "num_leaves": 64, "min_child_samples": 20, "alphas": [0.75, 0.90]},
     ("growth", "extreme"):         {"objective": "quantile", "num_leaves": 16, "min_child_samples": 10, "alphas": [0.75, 0.90]},
-    ("buzz_composite", "positive"): {"log": True},
+    ("buzz_composite", "positive"): {"log": True, "objective": "huber", "alpha": 1.0},
 }
 
-# 구간별 Optuna 탐색 범위 — (nl_low, nl_high, md_low, md_high)
-# 미정의 구간은 기본값(15, 127, 4, 10) 사용
+# 구간별 Optuna 탐색 범위 — (nl_low, nl_high, md_low, md_high, mc_low, mc_high)
+# 미정의 구간은 기본값(15, 127, 4, 10, 20, 200) 사용
 TUNE_SEARCH_SPACE = {
-    ("buzz_composite", "clf"):      (31, 127, 4, 10),
-    ("buzz_composite", "negative"): (15,  63, 4,  8),
-    ("buzz_composite", "neutral"):  (31, 127, 4, 10),
-    ("buzz_composite", "positive"): (15,  47, 4,  8),
+    ("buzz_composite", "clf"):      (31, 127, 4, 10,  20, 200),
+    ("buzz_composite", "clf1"):     (15,  63, 4,  8,  20, 200),  # neg vs rest
+    ("buzz_composite", "clf2"):     (31, 127, 4, 10,  20, 200),  # neutral vs positive
+    ("buzz_composite", "negative"): (15,  63, 4,  8,  20, 200),
+    ("buzz_composite", "neutral"):  (31, 127, 4, 10,  20, 200),
+    ("buzz_composite", "positive"): (15,  47, 4,  8,  10, 100),
 }
 
 # extreme 구간(양 끝) 샘플 가중치 — 소수 클래스 학습 보완
 EXTREME_WEIGHT = 2.0
+
+# sustainability 전용 파생 피처 — 기존 FEAT_COLS에서 계산, 데이터셋 재빌드 없이 추가
+SUST_EXTRA_FEATS = [
+    "search_stability", "search_pos_trend", "search_peak_retention",
+    "search_slope_ratio", "search_trend_quality", "search_vol_regime",
+]
+
+
+def _add_sust_features(df):
+    # search_cv_14d 역수 — 변동성이 낮을수록 지속성 높음
+    df["search_stability"]      = (1.0 / (df["search_cv_14d"] + 1e-6)).clip(0, 50)
+    # 단기 vs 중기 포지션 차이 — 포지션 상승/하락 방향
+    df["search_pos_trend"]      = df["search_pos_7d"] - df["search_pos_14d"]
+    # 현재 포지션 대비 30일 고점 유지율 — 얼마나 버티는지
+    df["search_peak_retention"] = (df["search_pos_7d"] / (df["search_pos_30d"] + 1e-6)).clip(0, 5)
+    # 단기/중기 기울기 비 — 모멘텀 가속 여부 (>1: 최근 강화, <1: 감속)
+    df["search_slope_ratio"]    = (df["search_slope_7d"] / (df["search_slope_14d"] + 1e-6)).clip(-5, 5)
+    # 방향성 있는 트렌드 강도 — trend_r2가 높고 상승 중이면 양수
+    df["search_trend_quality"]  = df["search_trend_r2_7d"] * np.sign(df["search_slope_7d"])
+    # 중기 대비 단기 변동성 변화 — 음수면 안정화 중
+    df["search_vol_regime"]     = (df["search_cv_14d"] - df["search_cv_30d"]).clip(-5, 5)
+    return df
 
 # 타겟별 single 회귀 파라미터 override — DEFAULT_PARAMS 일부를 덮어씀
 SINGLE_PARAMS_OVERRIDE = {
@@ -122,10 +146,32 @@ def make_weight(buckets, n_class):
 
 def soft_predict(clf, regressors, fallbacks, X, log_flags, hard=False):
     # clf 확률 가중합(soft) 또는 argmax 라우팅(hard)으로 최종 예측
+    # clf가 tuple이면 계층적 이진 분류기: (clf1=neg vs rest, clf2=neutral vs pos)
     # log_flags: bucket index → log1p 적용 여부 (per-bucket 독립 적용)
-    # hard=True: 가장 확률 높은 구간 회귀기만 사용 — 타 구간 예측값 오염 차단
     # regressors 값이 list이면 앙상블(평균), 단일 모델이면 그대로 사용
-    proba   = clf.predict_proba(X)
+    if isinstance(clf, tuple):
+        if len(clf) == 2:
+            clf1, clf2 = clf
+            p_nn  = clf1.predict_proba(X)[:, 1]
+            p_pos = clf2.predict_proba(X)[:, 1]
+            proba = np.stack([
+                1.0 - p_nn,
+                p_nn * (1.0 - p_pos),
+                p_nn * p_pos,
+            ], axis=1)
+        else:  # 3-stage: neg vs rest → neutral vs (mild+strong) → mild vs strong
+            clf1, clf2, clf3 = clf
+            p_nn     = clf1.predict_proba(X)[:, 1]
+            p_pos    = clf2.predict_proba(X)[:, 1]
+            p_strong = clf3.predict_proba(X)[:, 1]
+            proba = np.stack([
+                1.0 - p_nn,
+                p_nn * (1.0 - p_pos),
+                p_nn * p_pos * (1.0 - p_strong),
+                p_nn * p_pos * p_strong,
+            ], axis=1)
+    else:
+        proba = clf.predict_proba(X)
     buckets = np.argmax(proba, axis=1)  # hard routing용 구간 인덱스
 
     def _reg_pred(b_idx, model):
@@ -189,16 +235,17 @@ def split_data(df, train_stride=1):
 
 
 def _run_study(X_tr, y_tr, X_va, y_va, fixed, n_trials, w_tr, is_clf, label, dirs,
-               nl_low=15, nl_high=127, md_low=4, md_high=10):
-    # Optuna study — num_leaves/max_depth 탐색, trial별 best_iteration·과적합 기록
+               nl_low=15, nl_high=127, md_low=4, md_high=10, mc_low=20, mc_high=200):
+    # Optuna study — num_leaves/max_depth/min_child_samples 탐색, trial별 best_iteration·과적합 기록
     trial_records = []
 
     def objective(trial):
         params = {
             **fixed,
-            "n_estimators": 500,
-            "num_leaves": trial.suggest_int("num_leaves", nl_low, nl_high),
-            "max_depth":  trial.suggest_int("max_depth",  md_low, md_high),
+            "n_estimators":      500,
+            "num_leaves":        trial.suggest_int("num_leaves",        nl_low, nl_high),
+            "max_depth":         trial.suggest_int("max_depth",         md_low, md_high),
+            "min_child_samples": trial.suggest_int("min_child_samples", mc_low, mc_high),
         }
         m = lgb.LGBMClassifier(**params) if is_clf else lgb.LGBMRegressor(**params)
         m.fit(X_tr, y_tr, sample_weight=w_tr, eval_set=[(X_va, y_va)],
@@ -212,14 +259,15 @@ def _run_study(X_tr, y_tr, X_va, y_va, fixed, n_trials, w_tr, is_clf, label, dir
         overfit_gap = round(score_va - score_tr, 6)  # 양수일수록 과적합
 
         trial_records.append({
-            "trial":          trial.number,
-            "num_leaves":     params["num_leaves"],
-            "max_depth":      params["max_depth"],
-            "learning_rate":  params["learning_rate"],
-            "best_iteration": best_iter,
-            "train_score":    round(score_tr, 6),
-            "valid_score":    round(score_va, 6),
-            "overfit_gap":    overfit_gap,
+            "trial":             trial.number,
+            "num_leaves":        params["num_leaves"],
+            "max_depth":         params["max_depth"],
+            "min_child_samples": params["min_child_samples"],
+            "learning_rate":     params["learning_rate"],
+            "best_iteration":    best_iter,
+            "train_score":       round(score_tr, 6),
+            "valid_score":       round(score_va, 6),
+            "overfit_gap":       overfit_gap,
         })
         return score_va
 
@@ -235,14 +283,15 @@ def _run_study(X_tr, y_tr, X_va, y_va, fixed, n_trials, w_tr, is_clf, label, dir
 
 
 def _tune(X_tr, y_tr, X_va, y_va, fixed, n_trials, dirs, w_tr=None, label="",
-          nl_low=15, nl_high=127, md_low=4, md_high=10):
-    # num_leaves / max_depth Optuna 탐색 — learning_rate는 DEFAULT_PARAMS에서 수동 설정
+          nl_low=15, nl_high=127, md_low=4, md_high=10, mc_low=20, mc_high=200):
+    # num_leaves / max_depth / min_child_samples Optuna 탐색 — learning_rate는 DEFAULT_PARAMS에서 수동 설정
     is_clf = fixed.get("objective") in ("multiclass", "binary")
     lr     = fixed.get("learning_rate", 0.05)
-    print(f"    [tune] {label}  lr={lr}  trials={n_trials}  nl=[{nl_low},{nl_high}]  md=[{md_low},{md_high}]")
+    print(f"    [tune] {label}  lr={lr}  trials={n_trials}  nl=[{nl_low},{nl_high}]  md=[{md_low},{md_high}]  mc=[{mc_low},{mc_high}]")
 
     best, val = _run_study(X_tr, y_tr, X_va, y_va, fixed, n_trials, w_tr, is_clf, label, dirs,
-                           nl_low=nl_low, nl_high=nl_high, md_low=md_low, md_high=md_high)
+                           nl_low=nl_low, nl_high=nl_high, md_low=md_low, md_high=md_high,
+                           mc_low=mc_low, mc_high=mc_high)
     print(f"      best: {val:.4f}  {best}")
 
     return {**fixed, **best}
@@ -281,10 +330,11 @@ def run_staged(X_tr, y_tr, X_va, y_va, X_te, y_te, target, dirs, do_tune, n_tria
     names      = cfg["names"]
     use_log    = cfg["log"]
     n_class    = cfg["n_class"]
-    hard       = cfg.get("hard", False)
+    hard         = cfg.get("hard", False)
+    hierarchical = cfg.get("hierarchical", False)
 
     print(f"\n{'='*55}")
-    print(f"  [staged] {target}  thresholds={thresholds}  log={use_log}  n_class={n_class}  hard={hard}")
+    print(f"  [staged] {target}  thresholds={thresholds}  log={use_log}  n_class={n_class}  hard={hard}  hierarchical={hierarchical}")
     print(f"{'='*55}")
 
     b_tr = make_bucket(y_tr, thresholds)
@@ -298,19 +348,65 @@ def run_staged(X_tr, y_tr, X_va, y_va, X_te, y_te, target, dirs, do_tune, n_tria
 
     # STEP 1 — 분류기 학습
     print("\n  [STEP 1] Classifier")
-    clf_params = {**DEFAULT_CLF_PARAMS, "num_class": n_class}
-    if do_tune:
-        nl_low, nl_high, md_low, md_high = TUNE_SEARCH_SPACE.get((fam, "clf"), (15, 127, 4, 10))
-        clf_params = _tune(X_tr, b_tr, X_va, b_va, clf_params, n_trials, dirs, w_tr,
-                           label=f"{target}_clf", nl_low=nl_low, nl_high=nl_high,
-                           md_low=md_low, md_high=md_high)
+    if hierarchical:
+        # clf1: negative(0) vs (neutral+positive)(1)
+        b_bin1_tr = (b_tr > 0).astype(int)
+        b_bin1_va = (b_va > 0).astype(int)
+        w_clf1    = np.where(b_tr == 0, EXTREME_WEIGHT, 1.0)
+        clf1_params = {**DEFAULT_CLF_PARAMS, "objective": "binary", "metric": "binary_logloss"}
+        if do_tune:
+            nl_low, nl_high, md_low, md_high, mc_low, mc_high = TUNE_SEARCH_SPACE.get((fam, "clf1"), (15, 127, 4, 10, 20, 200))
+            clf1_params = _tune(X_tr, b_bin1_tr, X_va, b_bin1_va, clf1_params, n_trials, dirs, w_clf1,
+                                label=f"{target}_clf1", nl_low=nl_low, nl_high=nl_high,
+                                md_low=md_low, md_high=md_high, mc_low=mc_low, mc_high=mc_high)
+        clf1 = lgb.LGBMClassifier(**clf1_params)
+        clf1.fit(X_tr, b_bin1_tr, sample_weight=w_clf1, eval_set=[(X_va, b_bin1_va)],
+                 callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(-1)])
+        print(f"    clf1 (neg vs rest) valid accuracy: {float(np.mean(clf1.predict(X_va) == b_bin1_va)):.4f}")
+        clf1.booster_.save_model(os.path.join(dirs["models"], f"lgbm_{target}_clf1.txt"))
+        _shap_save(clf1, X_te.iloc[:min(3000, len(X_te))], f"{target}_clf1", dirs)
 
-    clf = lgb.LGBMClassifier(**clf_params)
-    clf.fit(X_tr, b_tr, sample_weight=w_tr, eval_set=[(X_va, b_va)],
-            callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(-1)])
-    print(f"    valid accuracy: {float(np.mean(clf.predict(X_va) == b_va)):.4f}")
-    clf.booster_.save_model(os.path.join(dirs["models"], f"lgbm_{target}_clf.txt"))
-    _shap_save(clf, X_te.iloc[:min(3000, len(X_te))], f"{target}_clf", dirs)
+        # clf2: neutral(0) vs positive(1) — non-negative 샘플만 사용
+        mask_non_neg_tr = b_tr > 0
+        mask_non_neg_va = b_va > 0
+        b_bin2_tr = (b_tr[mask_non_neg_tr] == 2).astype(int)
+        b_bin2_va = (b_va[mask_non_neg_va] == 2).astype(int)
+        w_clf2    = np.where(b_bin2_tr == 1, EXTREME_WEIGHT, 1.0)
+        clf2_params = {**DEFAULT_CLF_PARAMS, "objective": "binary", "metric": "binary_logloss"}
+        if do_tune:
+            nl_low, nl_high, md_low, md_high, mc_low, mc_high = TUNE_SEARCH_SPACE.get((fam, "clf2"), (31, 127, 4, 10, 20, 200))
+            clf2_params = _tune(X_tr[mask_non_neg_tr], b_bin2_tr, X_va[mask_non_neg_va], b_bin2_va,
+                                clf2_params, n_trials, dirs, w_clf2,
+                                label=f"{target}_clf2", nl_low=nl_low, nl_high=nl_high,
+                                md_low=md_low, md_high=md_high, mc_low=mc_low, mc_high=mc_high)
+        clf2 = lgb.LGBMClassifier(**clf2_params)
+        clf2.fit(X_tr[mask_non_neg_tr], b_bin2_tr, sample_weight=w_clf2,
+                 eval_set=[(X_va[mask_non_neg_va], b_bin2_va)],
+                 callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(-1)])
+        print(f"    clf2 (neutral vs pos) valid accuracy: {float(np.mean(clf2.predict(X_va[mask_non_neg_va]) == b_bin2_va)):.4f}")
+        clf2.booster_.save_model(os.path.join(dirs["models"], f"lgbm_{target}_clf2.txt"))
+        _shap_save(clf2, X_te[b_te > 0].iloc[:min(3000, int((b_te > 0).sum()))], f"{target}_clf2", dirs)
+
+        # 계층적 결합 3-class 정확도
+        p_nn  = clf1.predict_proba(X_va)[:, 1]
+        p_pos = clf2.predict_proba(X_va)[:, 1]
+        proba_combined = np.stack([1 - p_nn, p_nn * (1 - p_pos), p_nn * p_pos], axis=1)
+        acc_combined = float(np.mean(np.argmax(proba_combined, axis=1) == b_va))
+        print(f"    combined 3-class valid accuracy: {acc_combined:.4f}")
+        clf = (clf1, clf2)
+    else:
+        clf_params = {**DEFAULT_CLF_PARAMS, "num_class": n_class}
+        if do_tune:
+            nl_low, nl_high, md_low, md_high, mc_low, mc_high = TUNE_SEARCH_SPACE.get((fam, "clf"), (15, 127, 4, 10, 20, 200))
+            clf_params = _tune(X_tr, b_tr, X_va, b_va, clf_params, n_trials, dirs, w_tr,
+                               label=f"{target}_clf", nl_low=nl_low, nl_high=nl_high,
+                               md_low=md_low, md_high=md_high, mc_low=mc_low, mc_high=mc_high)
+        clf = lgb.LGBMClassifier(**clf_params)
+        clf.fit(X_tr, b_tr, sample_weight=w_tr, eval_set=[(X_va, b_va)],
+                callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(-1)])
+        print(f"    valid accuracy: {float(np.mean(clf.predict(X_va) == b_va)):.4f}")
+        clf.booster_.save_model(os.path.join(dirs["models"], f"lgbm_{target}_clf.txt"))
+        _shap_save(clf, X_te.iloc[:min(3000, len(X_te))], f"{target}_clf", dirs)
 
     # STEP 2 — 구간별 회귀기 학습
     print("\n  [STEP 2] Per-bucket Regressors")
@@ -364,10 +460,11 @@ def run_staged(X_tr, y_tr, X_va, y_va, X_te, y_te, target, dirs, do_tune, n_tria
             _shap_save(regs[0], shap_X, f"{target}_reg_{name}", dirs)
         else:
             if do_tune:
-                nl_low, nl_high, md_low, md_high = TUNE_SEARCH_SPACE.get((fam, name), (15, 127, 4, 10))
+                nl_low, nl_high, md_low, md_high, mc_low, mc_high = TUNE_SEARCH_SPACE.get((fam, name), (15, 127, 4, 10, 20, 200))
                 reg_params = _tune(X_tr[mask_tr], y_tr_b, xv_b, yv_b,
                                    reg_params, n_trials, dirs, label=f"{target}_reg_{name}",
-                                   nl_low=nl_low, nl_high=nl_high, md_low=md_low, md_high=md_high)
+                                   nl_low=nl_low, nl_high=nl_high, md_low=md_low, md_high=md_high,
+                                   mc_low=mc_low, mc_high=mc_high)
             reg = lgb.LGBMRegressor(**reg_params)
             reg.fit(X_tr[mask_tr], y_tr_b, eval_set=[(xv_b, yv_b)],
                     callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(-1)])
@@ -442,15 +539,12 @@ def main():
     print(f"output → {run_dir}")
 
     df = load_csv(args.data)
+    df = _add_sust_features(df)
     print(f"shape: {df.shape}")
 
     print(f"\n시계열 분할 (gap={GAP_DAYS}일, stride={args.train_stride})")
     train_df, valid_df, test_df = split_data(df, args.train_stride)
     print(f"features: {len(FEAT_COLS)}")
-
-    X_train = train_df[FEAT_COLS]
-    X_valid = valid_df[FEAT_COLS]
-    X_test  = test_df[FEAT_COLS]
 
     all_targets = list(TARGET_STRATEGY.keys())
     targets = all_targets if args.targets == "all" else [t.strip() for t in args.targets.split(",")]
@@ -458,6 +552,10 @@ def main():
     all_results = []
     for target in targets:
         strategy = TARGET_STRATEGY.get(target, "single")
+        feat_cols = FEAT_COLS + SUST_EXTRA_FEATS if _family(target) == "sustainability" else FEAT_COLS
+        X_train = train_df[feat_cols]
+        X_valid = valid_df[feat_cols]
+        X_test  = test_df[feat_cols]
         y_tr = train_df[target].values
         y_va = valid_df[target].values
         y_te = test_df[target].values

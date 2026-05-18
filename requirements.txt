@@ -8,3 +8,4 @@ lightgbm
 optuna
 shap
 scikit-learn
+h5py
