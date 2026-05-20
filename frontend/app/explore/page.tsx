@@ -13,10 +13,10 @@ export default async function ExplorePage() {
         <ScatterPlot data={summary} />
       </div>
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <Quad title="🌟 스타급" desc="성장 ↑ 지속성 ↑" rows={summary.filter(s => s.growth_10d >= 1.05 && s.sustainability_10d >= 1.0)} />
-        <Quad title="🐢 롱런" desc="성장 ≈ 지속성 ↑" rows={summary.filter(s => s.growth_10d < 1.05 && s.sustainability_10d >= 1.0)} />
-        <Quad title="✨ 반짝" desc="성장 ↑ 지속성 ↓" rows={summary.filter(s => s.growth_10d >= 1.05 && s.sustainability_10d < 1.0)} />
-        <Quad title="📉 하락" desc="성장 ↓ 지속성 ↓" rows={summary.filter(s => s.growth_10d < 1.05 && s.sustainability_10d < 1.0)} />
+        <Quad title="🌟 스타급" desc="성장 ↑ 지속성 ↑" rows={summary.filter(s => (s.growth_10d ?? 0) >= 1.05 && (s.sustainability_10d ?? 0) >= 1.0)} />
+        <Quad title="🐢 롱런" desc="성장 ≈ 지속성 ↑" rows={summary.filter(s => (s.growth_10d ?? 0) < 1.05 && (s.sustainability_10d ?? 0) >= 1.0)} />
+        <Quad title="✨ 반짝" desc="성장 ↑ 지속성 ↓" rows={summary.filter(s => (s.growth_10d ?? 0) >= 1.05 && (s.sustainability_10d ?? 0) < 1.0)} />
+        <Quad title="📉 하락" desc="성장 ↓ 지속성 ↓" rows={summary.filter(s => (s.growth_10d ?? 0) < 1.05 && (s.sustainability_10d ?? 0) < 1.0)} />
       </div>
     </div>
   );

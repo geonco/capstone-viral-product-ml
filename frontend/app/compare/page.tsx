@@ -65,11 +65,11 @@ export default async function ComparePage({ searchParams }: { searchParams: { ke
                   return (
                     <tr key={d.keyword} className="border-t border-border">
                       <td className="px-4 py-3 font-medium">{d.keyword}</td>
-                      <td className="px-4 py-3 text-right tabular-nums">×{s.growth_10d.toFixed(2)}</td>
-                      <td className="px-4 py-3 text-right tabular-nums">{s.sustainability_10d.toFixed(2)}</td>
-                      <td className="px-4 py-3 text-right tabular-nums">{s.buzz_composite_10d.toFixed(2)}</td>
-                      <td className="px-4 py-3 text-right tabular-nums">{s.fw_peak_softpos_10d.toFixed(1)}</td>
-                      <td className="px-4 py-3 text-right tabular-nums">{(s.crash_10d * 100).toFixed(0)}%</td>
+                      <td className="px-4 py-3 text-right tabular-nums">×{(s.growth_10d ?? 0).toFixed(2)}</td>
+                      <td className="px-4 py-3 text-right tabular-nums">{(s.sustainability_10d ?? 0).toFixed(2)}</td>
+                      <td className="px-4 py-3 text-right tabular-nums">{(s.buzz_composite_10d ?? 0).toFixed(2)}</td>
+                      <td className="px-4 py-3 text-right tabular-nums">{(s.fw_peak_softpos_10d ?? 0).toFixed(2)}</td>
+                      <td className="px-4 py-3 text-right tabular-nums">{((s.crash_10d ?? 0) * 100).toFixed(0)}%</td>
                     </tr>
                   );
                 })}
