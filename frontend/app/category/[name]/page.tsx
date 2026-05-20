@@ -7,7 +7,7 @@ const CATEGORIES = ["베이커리", "쿠키", "초콜릿/캔디", "한과/젤리
 export default async function CategoryPage({ params }: { params: { name: string } }) {
   const name = decodeURIComponent(params.name);
   const summary = await getSummary();
-  const filtered = summary.filter(s => s.category === name).sort((a, b) => b.growth_10d - a.growth_10d);
+  const filtered = summary.filter(s => s.category === name).sort((a, b) => (b.growth_10d ?? 0) - (a.growth_10d ?? 0));
 
   const sparkData: Record<string, { value: number | null }[]> = {};
   await Promise.all(filtered.map(async (s) => {
@@ -15,8 +15,8 @@ export default async function CategoryPage({ params }: { params: { name: string 
     if (d) sparkData[s.keyword] = d.timeseries.search.slice(-60).map(p => ({ value: p.value }));
   }));
 
-  const avgGrowth = filtered.length ? filtered.reduce((a, b) => a + b.growth_10d, 0) / filtered.length : 0;
-  const avgSustain = filtered.length ? filtered.reduce((a, b) => a + b.sustainability_10d, 0) / filtered.length : 0;
+  const avgGrowth = filtered.length ? filtered.reduce((a, b) => a + (b.growth_10d ?? 0), 0) / filtered.length : 0;
+  const avgSustain = filtered.length ? filtered.reduce((a, b) => a + (b.sustainability_10d ?? 0), 0) / filtered.length : 0;
 
   return (
     <div className="space-y-8">

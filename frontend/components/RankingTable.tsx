@@ -43,9 +43,9 @@ export function RankingTable({
                   <Sparkline data={sparkData[r.keyword]} color={r.delta_pct >= 0 ? "#34d399" : "#f87171"} />
                 )}
               </td>
-              <td className="px-4 py-3 text-right tabular-nums">×{r.growth_10d.toFixed(2)}</td>
-              <td className="px-4 py-3 text-right tabular-nums hidden sm:table-cell">{r.sustainability_10d.toFixed(2)}</td>
-              <td className="px-4 py-3 text-right tabular-nums hidden md:table-cell">{r.fw_peak_softpos_10d.toFixed(1)}</td>
+              <td className="px-4 py-3 text-right tabular-nums">×{(r.growth_10d ?? 0).toFixed(2)}</td>
+              <td className="px-4 py-3 text-right tabular-nums hidden sm:table-cell">{(r.sustainability_10d ?? 0).toFixed(2)}</td>
+              <td className="px-4 py-3 text-right tabular-nums hidden md:table-cell">{(r.fw_peak_softpos_10d ?? 0).toFixed(2)}</td>
               <td className={`px-4 py-3 text-right tabular-nums ${r.delta_pct >= 0 ? "text-good" : "text-bad"}`}>
                 {r.delta_pct >= 0 ? "+" : ""}{r.delta_pct.toFixed(1)}%
               </td>
